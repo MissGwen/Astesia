@@ -138,6 +138,8 @@ pub trait DatabaseDriver: Send + Sync {
 
     async fn get_enum_values(&self, _database: &str, _enum_type: &str) -> anyhow::Result<Vec<String>> { Ok(vec![]) }
 
+    async fn get_schemas(&self, _database: &str) -> anyhow::Result<Vec<String>> { Ok(vec![]) }
+
     async fn get_create_table_sql(&self, _database: &str, _table: &str) -> anyhow::Result<String> {
         Err(anyhow::anyhow!("Not supported for this database type"))
     }

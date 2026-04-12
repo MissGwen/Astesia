@@ -35,6 +35,7 @@ interface ForeignKeyInfo {
 interface Props {
   connectionId: string;
   database: string;
+  schema?: string; // For PG: filter to specific schema
 }
 
 const NODE_WIDTH = 250;
@@ -75,7 +76,7 @@ function applyDagreLayout(
   });
 }
 
-function ERDiagramInner({ connectionId, database }: Props) {
+function ERDiagramInner({ connectionId, database, schema }: Props) {
   const resolvedTheme = useThemeStore((s) => s.resolvedTheme);
   const [nodes, setNodes, onNodesChange] = useNodesState<Node<TableNodeData>>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
@@ -98,11 +99,15 @@ function ERDiagramInner({ connectionId, database }: Props) {
     setError(null);
 
     try {
-      // Step 1: Load all tables
-      const tables = await invoke<TableInfo[]>('get_tables', {
+      // Step 1: Load all tables, filter by schema if provided (PG)
+      let tables = await invoke<TableInfo[]>('get_tables', {
         connectionId,
         database,
       });
+
+      if (schema) {
+        tables = tables.filter((t) => t.schema === schema);
+      }
 
       if (!tables || tables.length === 0) {
         setNodes([]);
@@ -112,13 +117,16 @@ function ERDiagramInner({ connectionId, database }: Props) {
       }
 
       // Step 2: Load columns and foreign keys for every table in parallel
+      // For PG, use schema-qualified name for API calls
+      const qualifyName = (t: TableInfo) => schema ? `${schema}.${t.name}` : (t.schema ? `${t.schema}.${t.name}` : t.name);
+
       const [allColumns, allForeignKeys] = await Promise.all([
         Promise.all(
           tables.map((t) =>
             invoke<ColumnInfo[]>('get_columns', {
               connectionId,
               database,
-              table: t.name,
+              table: qualifyName(t),
             }).then((cols) => ({ table: t.name, columns: cols }))
           )
         ),
@@ -127,7 +135,7 @@ function ERDiagramInner({ connectionId, database }: Props) {
             invoke<ForeignKeyInfo[]>('get_foreign_keys', {
               connectionId,
               database,
-              table: t.name,
+              table: qualifyName(t),
             })
               .then((fks) => ({ table: t.name, foreignKeys: fks }))
               .catch(() => ({ table: t.name, foreignKeys: [] as ForeignKeyInfo[] }))
@@ -225,7 +233,7 @@ function ERDiagramInner({ connectionId, database }: Props) {
     } finally {
       setLoading(false);
     }
-  }, [connectionId, database, setNodes, setEdges]);
+  }, [connectionId, database, schema, setNodes, setEdges]);
 
   useEffect(() => {
     loadDiagram();

@@ -5,13 +5,13 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import Editor, { OnMount, BeforeMount } from '@monaco-editor/react';
 import { invoke } from '@tauri-apps/api/core';
 import { useTranslation } from 'react-i18next';
-import { QueryResult } from '@/types/database';
+import { QueryResult, TableInfo, ColumnInfo } from '@/types/database';
 import { Play, Eraser, Download, Loader2, Clock, Rows3, FolderOpen, Save, RefreshCw, BarChart3 } from 'lucide-react';
 import type { editor } from 'monaco-editor';
 import { cn } from '@/lib/utils';
 import { useTabStore } from '@/stores/tabStore';
 import { useThemeStore } from '@/stores/themeStore';
-import { configureMonacoForDialect, SqlDialect } from '@/lib/monacoSetup';
+import { configureMonacoForDialect, SqlDialect, registerDatabaseCompletions, clearDatabaseCompletions } from '@/lib/monacoSetup';
 import { open, save } from '@tauri-apps/plugin-dialog';
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
@@ -37,6 +37,7 @@ export default function QueryEditor({ connectionId, database, tabKey, dbType, in
   const [editorHeight, setEditorHeight] = useState(250);
   const [isResizingEditor, setIsResizingEditor] = useState(false);
   const editorRef = useRef<editor.IStandaloneCodeEditor | null>(null);
+  const monacoInstanceRef = useRef<typeof import('monaco-editor') | null>(null);
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const editorResizeRef = useRef({ startY: 0, startHeight: 0 });
   const updateTabContent = useTabStore((s) => s.updateTabContent);
@@ -49,6 +50,51 @@ export default function QueryEditor({ connectionId, database, tabKey, dbType, in
       }
     };
   }, []);
+
+  // Fetch database metadata and register Monaco autocompletions
+  useEffect(() => {
+    let cancelled = false;
+    const loadCompletions = async () => {
+      try {
+        const tables = await invoke<TableInfo[]>('get_tables', { connectionId, database });
+        if (cancelled) return;
+
+        // Fetch columns for up to 50 tables to keep it fast
+        const tablesToFetch = tables.slice(0, 50);
+        const tableData = await Promise.all(
+          tablesToFetch.map(async (t) => {
+            const tableName =
+              t.schema && dbType === 'postgresql' ? `${t.schema}.${t.name}` : t.name;
+            try {
+              const cols = await invoke<ColumnInfo[]>('get_columns', {
+                connectionId,
+                database,
+                table: tableName,
+              });
+              return {
+                name: t.name,
+                schema: t.schema || undefined,
+                columns: cols.map((c) => ({ name: c.name, type: c.data_type })),
+              };
+            } catch {
+              return { name: t.name, schema: t.schema || undefined, columns: [] };
+            }
+          }),
+        );
+
+        if (cancelled || !monacoInstanceRef.current) return;
+        registerDatabaseCompletions(monacoInstanceRef.current, { tables: tableData }, dbType || '');
+      } catch (e) {
+        console.error('Failed to load database completions:', e);
+      }
+    };
+
+    loadCompletions();
+    return () => {
+      cancelled = true;
+      clearDatabaseCompletions();
+    };
+  }, [connectionId, database, dbType]);
 
   const handleEditorResizeStart = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
@@ -88,6 +134,7 @@ export default function QueryEditor({ connectionId, database, tabKey, dbType, in
   );
 
   const handleBeforeMount: BeforeMount = (monaco) => {
+    monacoInstanceRef.current = monaco;
     if (dbType) {
       configureMonacoForDialect(monaco, dbType as SqlDialect);
     }

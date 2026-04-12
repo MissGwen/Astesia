@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use sqlx::mysql::{MySqlPool, MySqlPoolOptions, MySqlRow};
 use sqlx::{Column, Row};
 use std::time::Instant;
@@ -59,10 +60,22 @@ impl DatabaseDriver for MySqlDriver {
 
     async fn get_databases(&self) -> anyhow::Result<Vec<String>> {
         let pool = self.pool()?;
-        let rows: Vec<(String,)> = sqlx::query_as("SHOW DATABASES")
+        let rows: Vec<MySqlRow> = sqlx::query("SHOW DATABASES")
             .fetch_all(pool)
             .await?;
-        Ok(rows.into_iter().map(|r| r.0).collect())
+        let databases = rows
+            .iter()
+            .filter_map(|row| {
+                row.try_get::<String, _>(0)
+                    .or_else(|_| {
+                        // Some MySQL configs return VARBINARY instead of VARCHAR
+                        row.try_get::<Vec<u8>, _>(0)
+                            .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+                    })
+                    .ok()
+            })
+            .collect();
+        Ok(databases)
     }
 
     async fn get_tables(&self, database: &str) -> anyhow::Result<Vec<TableInfo>> {
@@ -176,9 +189,16 @@ impl DatabaseDriver for MySqlDriver {
                         .iter()
                         .enumerate()
                         .map(|(i, _)| {
-                            row.try_get::<String, _>(i)
-                                .map(serde_json::Value::String)
+                            row.try_get::<NaiveDateTime, _>(i)
+                                .map(|v| serde_json::Value::String(v.to_string()))
+                                .or_else(|_| row.try_get::<NaiveDate, _>(i)
+                                    .map(|v| serde_json::Value::String(v.to_string())))
+                                .or_else(|_| row.try_get::<NaiveTime, _>(i)
+                                    .map(|v| serde_json::Value::String(v.to_string())))
+                                .or_else(|_| row.try_get::<String, _>(i)
+                                    .map(serde_json::Value::String))
                                 .or_else(|_| row.try_get::<i64, _>(i).map(|v| serde_json::Value::Number(v.into())))
+                                .or_else(|_| row.try_get::<i32, _>(i).map(|v| serde_json::Value::Number(v.into())))
                                 .or_else(|_| row.try_get::<f64, _>(i).map(|v| {
                                     serde_json::Number::from_f64(v)
                                         .map(serde_json::Value::Number)

@@ -6,14 +6,16 @@ import { useTranslation } from 'react-i18next';
 import { QueryResult, ColumnInfo } from '@/types/database';
 import { CellChange, NewRow } from '@/types/editing';
 import {
-  RefreshCw, Download, Loader2, ChevronLeft, ChevronRight,
+  RefreshCw, Download, Loader2, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight,
   Plus, Trash2, Save, Undo2, AlertTriangle, ClipboardPaste, BarChart3,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useTabStore } from '@/stores/tabStore';
+import { notify } from '@/stores/notificationStore';
 import {
   ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuSeparator, ContextMenuTrigger,
 } from '@/components/ui/context-menu';
+// virtualization removed — 100 rows/page doesn't need it
 
 function parseClipboardData(text: string): string[][] {
   // Handle both CSV (comma-separated) and TSV (tab-separated, from Excel)
@@ -75,6 +77,7 @@ export default function DataGrid({ connectionId, database, table }: Props) {
   const [saving, setSaving] = useState(false);
   const [page, setPage] = useState(1);
   const [pageSize] = useState(100);
+  const [totalRows, setTotalRows] = useState<number | null>(null);
 
   // Editing state
   const [editingCell, setEditingCell] = useState<{ row: number; col: number } | null>(null);
@@ -87,6 +90,11 @@ export default function DataGrid({ connectionId, database, table }: Props) {
   const [lastSelectedRow, setLastSelectedRow] = useState<number | null>(null);
   const [enumValues, setEnumValues] = useState<string[]>([]);
   const [editColType, setEditColType] = useState<string>('text');
+
+  // Cell range selection state
+  const [selectionStart, setSelectionStart] = useState<{row: number, col: number} | null>(null);
+  const [selectionEnd, setSelectionEnd] = useState<{row: number, col: number} | null>(null);
+  const [isDragging, setIsDragging] = useState(false);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const editInputRef = useRef<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>(null);
@@ -105,6 +113,8 @@ export default function DataGrid({ connectionId, database, table }: Props) {
   const hasPrimaryKey = primaryKeyColumn !== null;
 
   const hasChanges = pendingChanges.size > 0 || newRows.length > 0 || deletedRows.size > 0;
+
+  const totalRowCount = (result?.rows.length || 0) + newRows.length;
 
   const loadData = useCallback(async () => {
     setLoading(true);
@@ -129,6 +139,20 @@ export default function DataGrid({ connectionId, database, table }: Props) {
         });
       }
       setResult(data);
+
+      // Fetch total row count via COUNT query
+      try {
+        const countResult = await invoke<QueryResult>('execute_query', {
+          connectionId, database,
+          sql: `SELECT COUNT(*) FROM ${table.includes('.') ? `"${table.split('.')[0]}"."${table.split('.')[1]}"` : `"${table}"`}`,
+        });
+        if (countResult.rows.length > 0 && countResult.rows[0].length > 0) {
+          const count = Number(countResult.rows[0][0]);
+          if (!isNaN(count)) setTotalRows(count);
+        }
+      } catch {
+        // COUNT failed — leave totalRows as null
+      }
     } catch (e: any) {
       console.error(e);
     } finally {
@@ -147,6 +171,9 @@ export default function DataGrid({ connectionId, database, table }: Props) {
     setSelectedRows(new Set());
     setChangeHistory([]);
     setLastSelectedRow(null);
+    setSelectionStart(null);
+    setSelectionEnd(null);
+    setIsDragging(false);
   }, [connectionId, database, table, page]);
 
   // Focus edit input when editing cell changes
@@ -158,6 +185,23 @@ export default function DataGrid({ connectionId, database, table }: Props) {
       }
     }
   }, [editingCell, editColType]);
+
+  // Cell range selection helper
+  const isCellInSelection = useCallback((row: number, col: number) => {
+    if (!selectionStart || !selectionEnd) return false;
+    const minRow = Math.min(selectionStart.row, selectionEnd.row);
+    const maxRow = Math.max(selectionStart.row, selectionEnd.row);
+    const minCol = Math.min(selectionStart.col, selectionEnd.col);
+    const maxCol = Math.max(selectionStart.col, selectionEnd.col);
+    return row >= minRow && row <= maxRow && col >= minCol && col <= maxCol;
+  }, [selectionStart, selectionEnd]);
+
+  // Mouse up listener for ending cell drag-select
+  useEffect(() => {
+    const handleMouseUp = () => setIsDragging(false);
+    document.addEventListener('mouseup', handleMouseUp);
+    return () => document.removeEventListener('mouseup', handleMouseUp);
+  }, []);
 
   // Keyboard shortcuts handler (Ctrl+Z, Ctrl+V, Ctrl+C)
   useEffect(() => {
@@ -171,7 +215,11 @@ export default function DataGrid({ connectionId, database, table }: Props) {
         handlePaste();
       }
       if ((e.ctrlKey || e.metaKey) && e.key === 'c') {
-        if (selectedRows.size > 0 && result) {
+        // Cell range selection copy takes priority
+        if (selectionStart && selectionEnd && result) {
+          e.preventDefault();
+          handleCopyCells();
+        } else if (selectedRows.size > 0 && result) {
           e.preventDefault();
           handleCopyRows();
         }
@@ -514,30 +562,28 @@ export default function DataGrid({ connectionId, database, table }: Props) {
   };
 
   // Row selection
-  const handleRowSelect = (rowIndex: number, shiftKey: boolean) => {
-    if (shiftKey && lastSelectedRow !== null) {
+  const handleRowSelect = useCallback((rowIndex: number, e: { ctrlKey: boolean; metaKey: boolean; shiftKey: boolean }) => {
+    if (e.shiftKey && lastSelectedRow !== null) {
+      // Shift+click: range select from last selected to current
       const start = Math.min(lastSelectedRow, rowIndex);
       const end = Math.max(lastSelectedRow, rowIndex);
+      const rangeSet = new Set<number>();
+      for (let i = start; i <= end; i++) rangeSet.add(i);
+      setSelectedRows(rangeSet);
+    } else if (e.ctrlKey || e.metaKey) {
+      // Ctrl+click: toggle this row in the selection
       setSelectedRows((prev) => {
         const newSet = new Set(prev);
-        for (let i = start; i <= end; i++) {
-          newSet.add(i);
-        }
+        if (newSet.has(rowIndex)) newSet.delete(rowIndex);
+        else newSet.add(rowIndex);
         return newSet;
       });
     } else {
-      setSelectedRows((prev) => {
-        const newSet = new Set(prev);
-        if (newSet.has(rowIndex)) {
-          newSet.delete(rowIndex);
-        } else {
-          newSet.add(rowIndex);
-        }
-        return newSet;
-      });
+      // Plain click: single-select (replace entire selection)
+      setSelectedRows(new Set([rowIndex]));
     }
     setLastSelectedRow(rowIndex);
-  };
+  }, [lastSelectedRow]);
 
   // Add new row
   const handleAddRow = () => {
@@ -617,6 +663,7 @@ export default function DataGrid({ connectionId, database, table }: Props) {
       }
 
       // Reset state and reload
+      const count = pendingChanges.size + newRows.length + deletedRows.size;
       setPendingChanges(new Map());
       setNewRows([]);
       setDeletedRows(new Set());
@@ -624,8 +671,10 @@ export default function DataGrid({ connectionId, database, table }: Props) {
       setChangeHistory([]);
       setEditingCell(null);
       await loadData();
+      notify.success(t('common.success'), `${t('table.saveChanges')}: ${count}`);
     } catch (e: any) {
       console.error('保存失败:', e);
+      notify.error(t('common.error'), String(e));
     } finally {
       setSaving(false);
     }
@@ -714,6 +763,26 @@ export default function DataGrid({ connectionId, database, table }: Props) {
     navigator.clipboard.writeText(headers + '\n' + rows);
   };
 
+  // Copy selected cell range as TSV
+  const handleCopyCells = () => {
+    if (!result || !selectionStart || !selectionEnd) return;
+    const minRow = Math.min(selectionStart.row, selectionEnd.row);
+    const maxRow = Math.max(selectionStart.row, selectionEnd.row);
+    const minCol = Math.min(selectionStart.col, selectionEnd.col);
+    const maxCol = Math.max(selectionStart.col, selectionEnd.col);
+    const headers = result.columns.slice(minCol, maxCol + 1).map(c => c.name).join('\t');
+    const rows: string[] = [];
+    for (let r = minRow; r <= maxRow; r++) {
+      const cells: string[] = [];
+      for (let c = minCol; c <= maxCol; c++) {
+        const val = getCellDisplayValue(r, c);
+        cells.push(val === null ? '' : String(val));
+      }
+      rows.push(cells.join('\t'));
+    }
+    navigator.clipboard.writeText(headers + '\n' + rows.join('\n'));
+  };
+
   // Get display value for a cell (considering pending changes)
   const getCellDisplayValue = (rowIndex: number, colIndex: number): any => {
     if (!result) return null;
@@ -754,9 +823,10 @@ export default function DataGrid({ connectionId, database, table }: Props) {
           {t('query.export')}
         </Button>
         <Button variant="ghost" size="sm" onClick={() => {
+          const displayName = table.includes('.') ? table.split('.').pop()! : table;
           useTabStore.getState().addTab({
             key: `chart-${connectionId}-${database}-${table}`,
-            label: `${table} [图表]`,
+            label: `${displayName} [图表]`,
             type: 'data-chart',
             connectionId,
             database,
@@ -829,9 +899,22 @@ export default function DataGrid({ connectionId, database, table }: Props) {
         )}
 
         <div className="ml-auto flex items-center gap-1.5">
-          <Badge variant="outline" className="font-mono text-[11px]">{database}</Badge>
-          <span className="text-muted-foreground">.</span>
-          <Badge variant="outline" className="font-mono text-[11px]">{table}</Badge>
+          {(() => {
+            const tableParts = table.includes('.') ? table.split('.') : [table];
+            return (
+              <>
+                <Badge variant="outline" className="font-mono text-[11px]">{database}</Badge>
+                {tableParts.length > 1 && (
+                  <>
+                    <span className="text-muted-foreground">.</span>
+                    <Badge variant="outline" className="font-mono text-[11px]">{tableParts[0]}</Badge>
+                  </>
+                )}
+                <span className="text-muted-foreground">.</span>
+                <Badge variant="outline" className="font-mono text-[11px]">{tableParts[tableParts.length - 1]}</Badge>
+              </>
+            );
+          })()}
         </div>
       </div>
 
@@ -843,7 +926,7 @@ export default function DataGrid({ connectionId, database, table }: Props) {
             <span>{t('common.loading')}</span>
           </div>
         ) : result && result.columns.length > 0 ? (
-          <div className="flex-1 overflow-auto h-full">
+          <div className="flex-1 overflow-auto h-full" onContextMenu={(e) => e.preventDefault()}>
               <table className="text-sm" style={{ tableLayout: 'fixed', width: 'max-content', minWidth: '100%' }}>
                 <thead className="sticky top-0 z-10 bg-muted/60">
                   <tr className="border-b bg-muted/60">
@@ -868,21 +951,92 @@ export default function DataGrid({ connectionId, database, table }: Props) {
                   </tr>
                 </thead>
                 <tbody>
-                  {/* Existing rows */}
-                  {result.rows.length > 0 ? (
-                    result.rows.map((row, ri) => {
+                  {/* Data rows */}
+                  {totalRowCount > 0 ? (
+                    Array.from({ length: totalRowCount }, (_, ri) => {
+                      const existingRowCount = result.rows.length;
+                      const isNewRow = ri >= existingRowCount;
+
+                      if (isNewRow) {
+                        // Render new row
+                        const nri = ri - existingRowCount;
+                        const newRow = newRows[nri];
+                        if (!newRow) return null;
+
+                        return (
+                          <tr
+                            key={`new-${nri}`}
+                            data-index={ri}
+                            className="border-b border-l-2 border-l-emerald-400 bg-emerald-50/50 dark:bg-emerald-950/10"
+                          >
+                            <td className="px-3 py-1.5 text-center text-xs text-emerald-600 font-medium">
+                              +
+                            </td>
+                            {result.columns.map((col) => (
+                              <td
+                                key={col.name}
+                                style={{ width: columnWidths[col.name] || 160, minWidth: 80 }}
+                                className="border-l px-4 py-1.5 font-mono text-xs"
+                              >
+                                {(() => {
+                                  const dt = col.data_type.toLowerCase();
+                                  const baseClass = "w-full rounded-sm border border-dashed border-emerald-400/60 bg-background px-1.5 py-0.5 text-xs font-mono text-foreground outline-none select-text focus:border-solid focus:border-primary/50 focus:ring-1 focus:ring-primary";
+                                  const val = newRow.values[col.name] === null ? '' : String(newRow.values[col.name]);
+
+                                  if (dt === 'boolean' || dt === 'bool') {
+                                    return (
+                                      <select className={baseClass + " cursor-pointer"} value={val} onChange={(e) => handleNewRowCellChange(nri, col.name, e.target.value)}>
+                                        <option value="">NULL</option>
+                                        <option value="true">true</option>
+                                        <option value="false">false</option>
+                                      </select>
+                                    );
+                                  }
+                                  if (dt.includes('timestamp') || dt.includes('datetime')) {
+                                    return <input type="datetime-local" className={baseClass} value={val || new Date().toISOString().slice(0, 16)} onChange={(e) => handleNewRowCellChange(nri, col.name, e.target.value)} />;
+                                  }
+                                  if (dt === 'date') {
+                                    return <input type="date" className={baseClass} value={val || new Date().toISOString().slice(0, 10)} onChange={(e) => handleNewRowCellChange(nri, col.name, e.target.value)} />;
+                                  }
+                                  if (dt === 'time' || dt.includes('time without') || dt.includes('timetz')) {
+                                    return <input type="time" className={baseClass} value={val || new Date().toTimeString().slice(0, 8)} onChange={(e) => handleNewRowCellChange(nri, col.name, e.target.value)} />;
+                                  }
+                                  if (dt === 'json' || dt === 'jsonb') {
+                                    return <textarea className={baseClass + " h-12 resize-y"} placeholder="{}" value={val} onChange={(e) => handleNewRowCellChange(nri, col.name, e.target.value)} />;
+                                  }
+                                  const isNum = ['int', 'integer', 'bigint', 'smallint', 'numeric', 'decimal', 'float', 'double', 'real', 'serial'].some(t => dt.includes(t));
+                                  return (
+                                    <input
+                                      type={isNum ? 'number' : 'text'}
+                                      step={isNum ? (dt.includes('int') ? '1' : 'any') : undefined}
+                                      className={baseClass}
+                                      placeholder={col.nullable ? 'NULL' : col.name}
+                                      value={val}
+                                      onChange={(e) => handleNewRowCellChange(nri, col.name, e.target.value)}
+                                    />
+                                  );
+                                })()}
+                              </td>
+                            ))}
+                          </tr>
+                        );
+                      }
+
+                      // Render existing row
                       const isDeleted = deletedRows.has(ri);
                       const isSelected = selectedRows.has(ri);
 
                       return (
                         <tr
                           key={ri}
+                          data-index={ri}
+                          onClick={(e) => handleRowSelect(ri, e)}
                           className={cn(
-                            "border-b transition-colors",
+                            "border-b transition-colors cursor-pointer",
                             isDeleted
                               ? "bg-red-50 line-through dark:bg-red-950/20"
                               : isSelected
-                                ? "bg-blue-50 dark:bg-blue-950/20"
+                                ? "bg-blue-500/10 dark:bg-blue-400/10"
                                 : "hover:bg-muted/30",
                           )}
                         >
@@ -891,14 +1045,15 @@ export default function DataGrid({ connectionId, database, table }: Props) {
                               "px-3 py-1.5 text-center text-xs text-muted-foreground cursor-pointer select-none",
                               isSelected && "font-bold text-blue-600 dark:text-blue-400",
                             )}
-                            onClick={(e) => handleRowSelect(ri, e.shiftKey)}
+                            onClick={(e) => handleRowSelect(ri, e)}
                           >
                             {(page - 1) * pageSize + ri + 1}
                           </td>
-                          {row.map((_, ci) => {
+                          {result.rows[ri].map((_, ci) => {
                             const cellValue = getCellDisplayValue(ri, ci);
                             const dirty = isCellDirty(ri, ci);
                             const isEditing = editingCell?.row === ri && editingCell?.col === ci;
+                            const inCellSelection = isCellInSelection(ri, ci);
 
                             return (
                               <ContextMenu key={ci}>
@@ -911,8 +1066,21 @@ export default function DataGrid({ connectionId, database, table }: Props) {
                                       typeof cellValue === 'object' && cellValue !== null && "text-blue-600",
                                       dirty && "bg-amber-50 dark:bg-amber-950/20 border-l-2 border-l-amber-400",
                                       isDeleted && "opacity-50",
+                                      inCellSelection && !dirty && "bg-blue-100 dark:bg-blue-900/30",
                                     )}
                                     onDoubleClick={() => handleCellDoubleClick(ri, ci)}
+                                    onMouseDown={(e) => {
+                                      if (e.detail === 2) return; // double-click handled separately
+                                      setSelectionStart({ row: ri, col: ci });
+                                      setSelectionEnd({ row: ri, col: ci });
+                                      setIsDragging(true);
+                                      e.preventDefault();
+                                    }}
+                                    onMouseEnter={() => {
+                                      if (isDragging) {
+                                        setSelectionEnd({ row: ri, col: ci });
+                                      }
+                                    }}
                                   >
                                     {isEditing ? (
                                       renderCellEditor()
@@ -956,71 +1124,14 @@ export default function DataGrid({ connectionId, database, table }: Props) {
                         </tr>
                       );
                     })
-                  ) : newRows.length === 0 ? (
+                  ) : (
                     <tr>
                       <td colSpan={result.columns.length + 1} className="py-12 text-center text-sm text-muted-foreground">
                         {t('common.noData')}
                       </td>
                     </tr>
-                  ) : null}
+                  )}
 
-                  {/* New rows */}
-                  {newRows.map((newRow, nri) => (
-                    <tr
-                      key={`new-${nri}`}
-                      className="border-b border-l-2 border-l-emerald-400 bg-emerald-50/50 dark:bg-emerald-950/10"
-                    >
-                      <td className="px-3 py-1.5 text-center text-xs text-emerald-600 font-medium">
-                        +
-                      </td>
-                      {result.columns.map((col) => (
-                        <td
-                          key={col.name}
-                          style={{ width: columnWidths[col.name] || 160, minWidth: 80 }}
-                          className="border-l px-4 py-1.5 font-mono text-xs"
-                        >
-                          {(() => {
-                            const dt = col.data_type.toLowerCase();
-                            const baseClass = "w-full rounded-sm border border-dashed border-emerald-400/60 bg-background px-1.5 py-0.5 text-xs font-mono text-foreground outline-none select-text focus:border-solid focus:border-primary/50 focus:ring-1 focus:ring-primary";
-                            const val = newRow.values[col.name] === null ? '' : String(newRow.values[col.name]);
-
-                            if (dt === 'boolean' || dt === 'bool') {
-                              return (
-                                <select className={baseClass + " cursor-pointer"} value={val} onChange={(e) => handleNewRowCellChange(nri, col.name, e.target.value)}>
-                                  <option value="">NULL</option>
-                                  <option value="true">true</option>
-                                  <option value="false">false</option>
-                                </select>
-                              );
-                            }
-                            if (dt.includes('timestamp') || dt.includes('datetime')) {
-                              return <input type="datetime-local" className={baseClass} value={val || new Date().toISOString().slice(0, 16)} onChange={(e) => handleNewRowCellChange(nri, col.name, e.target.value)} />;
-                            }
-                            if (dt === 'date') {
-                              return <input type="date" className={baseClass} value={val || new Date().toISOString().slice(0, 10)} onChange={(e) => handleNewRowCellChange(nri, col.name, e.target.value)} />;
-                            }
-                            if (dt === 'time' || dt.includes('time without') || dt.includes('timetz')) {
-                              return <input type="time" className={baseClass} value={val || new Date().toTimeString().slice(0, 8)} onChange={(e) => handleNewRowCellChange(nri, col.name, e.target.value)} />;
-                            }
-                            if (dt === 'json' || dt === 'jsonb') {
-                              return <textarea className={baseClass + " h-12 resize-y"} placeholder="{}" value={val} onChange={(e) => handleNewRowCellChange(nri, col.name, e.target.value)} />;
-                            }
-                            const isNum = ['int', 'integer', 'bigint', 'smallint', 'numeric', 'decimal', 'float', 'double', 'real', 'serial'].some(t => dt.includes(t));
-                            return (
-                              <input
-                                type={isNum ? 'number' : 'text'}
-                                step={isNum ? (dt.includes('int') ? '1' : 'any') : undefined}
-                                className={baseClass}
-                                placeholder={col.nullable ? 'NULL' : col.name}
-                                value={val}
-                                onChange={(e) => handleNewRowCellChange(nri, col.name, e.target.value)}
-                              />
-                            );
-                          })()}
-                        </td>
-                      ))}
-                    </tr>
-                  ))}
                 </tbody>
               </table>
           </div>
@@ -1034,17 +1145,31 @@ export default function DataGrid({ connectionId, database, table }: Props) {
       {/* Pagination */}
       <div className="flex shrink-0 items-center justify-between border-t bg-muted/30 px-4 py-1.5">
         <span className="text-xs text-muted-foreground">
-          {result ? `${result.rows.length} ${t('query.rows')}` : ''}
+          {result ? (
+            <>
+              显示 {result.rows.length > 0 ? (page-1)*pageSize + 1 : 0} - {(page-1)*pageSize + result.rows.length} 行
+              {totalRows !== null && <span className="ml-1">/ 共 {totalRows} 行</span>}
+            </>
+          ) : ''}
           {hasChanges && (
             <span className="ml-2 text-amber-600">
               ({pendingChanges.size} 项修改, {newRows.length} 项新增, {deletedRows.size} 项删除)
             </span>
           )}
           {hasPrimaryKey && (
-            <span className="ml-3 text-[10px] opacity-50">Ctrl+C 复制 | Ctrl+V 粘贴 CSV/Excel</span>
+            <span className="ml-2 text-[10px] opacity-50">Ctrl+C 复制 | Ctrl+V 粘贴</span>
           )}
         </span>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-1">
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-7 w-7"
+            disabled={page <= 1 || hasChanges}
+            onClick={() => setPage(1)}
+          >
+            <ChevronsLeft className="h-4 w-4" />
+          </Button>
           <Button
             variant="ghost"
             size="icon"
@@ -1054,7 +1179,17 @@ export default function DataGrid({ connectionId, database, table }: Props) {
           >
             <ChevronLeft className="h-4 w-4" />
           </Button>
-          <span className="min-w-[60px] text-center text-xs">{t('table.page')} {page}</span>
+          <input
+            type="number"
+            min={1}
+            value={page}
+            onChange={(e) => {
+              const p = parseInt(e.target.value);
+              if (p > 0 && !hasChanges) setPage(p);
+            }}
+            className="h-7 w-14 rounded border border-input bg-transparent px-2 text-center text-xs select-text"
+            disabled={hasChanges}
+          />
           <Button
             variant="ghost"
             size="icon"
@@ -1064,6 +1199,18 @@ export default function DataGrid({ connectionId, database, table }: Props) {
           >
             <ChevronRight className="h-4 w-4" />
           </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-7 w-7"
+            disabled={!result || result.rows.length < pageSize || hasChanges || totalRows === null}
+            onClick={() => {
+              if (totalRows !== null) setPage(Math.max(1, Math.ceil(totalRows / pageSize)));
+            }}
+          >
+            <ChevronsRight className="h-4 w-4" />
+          </Button>
+          <span className="ml-2 text-xs text-muted-foreground">{pageSize} 行/页</span>
         </div>
       </div>
     </div>

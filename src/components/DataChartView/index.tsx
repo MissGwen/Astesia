@@ -14,9 +14,10 @@ import {
   ResponsiveContainer,
 } from 'recharts';
 import {
-  RefreshCw, Loader2, PanelLeftClose, PanelLeftOpen, BarChart3,
+  RefreshCw, Loader2, PanelLeftClose, PanelLeftOpen, BarChart3, Table2,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { useTabStore } from '@/stores/tabStore';
 
 const COLORS = [
   'hsl(210, 80%, 55%)',
@@ -48,14 +49,26 @@ export default function DataChartView({ connectionId, database, table }: Props) 
   const [yAxes, setYAxes] = useState<string[]>([]);
   const [configCollapsed, setConfigCollapsed] = useState(false);
 
-  // Load data
+  // Load ALL data (fetch pages until exhausted)
   const loadData = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await invoke<QueryResult>('get_table_data', {
-        connectionId, database, table, page: 1, pageSize: 500,
-      });
-      setResult(data);
+      const batchSize = 1000;
+      let page = 1;
+      let allRows: any[][] = [];
+      let columns: QueryResult['columns'] = [];
+
+      while (true) {
+        const data = await invoke<QueryResult>('get_table_data', {
+          connectionId, database, table, page, pageSize: batchSize,
+        });
+        if (page === 1) columns = data.columns;
+        allRows = allRows.concat(data.rows);
+        if (data.rows.length < batchSize) break;
+        page++;
+      }
+
+      setResult({ columns, rows: allRows, affected_rows: 0, execution_time_ms: 0 });
     } catch (e: any) {
       console.error(e);
     } finally {
@@ -108,9 +121,43 @@ export default function DataChartView({ connectionId, database, table }: Props) 
     }
   }, [numericColumns, stringColumns, result]);
 
-  // Transform data for recharts
+  // Transform data for recharts — aggregate rows with duplicate X values
   const chartData = useMemo(() => {
-    if (!result) return [];
+    if (!result || !xAxis) return [];
+
+    const xColIndex = result.columns.findIndex(c => c.name === xAxis);
+    if (xColIndex < 0) return [];
+
+    // Always aggregate by X value when X is a string column
+    if (stringColumns.includes(xAxis)) {
+      // Aggregate: group by X value, sum numeric Y columns
+      const grouped = new Map<string, { count: number; sums: Record<string, number> }>();
+      result.rows.forEach(row => {
+        const xVal = String(row[xColIndex] ?? '');
+        if (!grouped.has(xVal)) {
+          grouped.set(xVal, { count: 0, sums: {} });
+        }
+        const entry = grouped.get(xVal)!;
+        entry.count++;
+        result.columns.forEach((col, i) => {
+          if (col.name === xAxis) return;
+          const val = row[i];
+          const num = typeof val === 'number' ? val : (typeof val === 'string' && val !== '' && !isNaN(Number(val)) ? Number(val) : 0);
+          entry.sums[col.name] = (entry.sums[col.name] || 0) + num;
+        });
+      });
+
+      return Array.from(grouped.entries()).map(([xVal, entry]) => {
+        const obj: Record<string, any> = { [xAxis]: xVal };
+        Object.entries(entry.sums).forEach(([col, sum]) => {
+          obj[col] = Math.round(sum * 100) / 100; // SUM, rounded to 2 decimals
+        });
+        obj['_count'] = entry.count;
+        return obj;
+      });
+    }
+
+    // No significant duplicates — use raw rows
     return result.rows.map(row => {
       const obj: Record<string, any> = {};
       result.columns.forEach((col, i) => {
@@ -121,7 +168,7 @@ export default function DataChartView({ connectionId, database, table }: Props) 
       });
       return obj;
     });
-  }, [result]);
+  }, [result, xAxis, stringColumns]);
 
   // All column names for X axis selection (both string and numeric)
   const allColumns = useMemo(() => {
@@ -306,6 +353,21 @@ export default function DataChartView({ connectionId, database, table }: Props) 
           {t('chart.config')}
         </Button>
 
+        <Button variant="ghost" size="sm" onClick={() => {
+          const displayName = table.includes('.') ? table.split('.').pop()! : table;
+          useTabStore.getState().addTab({
+            key: `data-${connectionId}-${database}-${table}`,
+            label: `${displayName} [${database}]`,
+            type: 'table-data',
+            connectionId,
+            database,
+            table,
+          });
+        }}>
+          <Table2 className="mr-1.5 h-3.5 w-3.5" />
+          返回表格
+        </Button>
+
         <div className="ml-auto flex items-center gap-1.5 text-xs text-muted-foreground">
           <span className="font-mono">{database}.{table}</span>
         </div>
@@ -341,6 +403,12 @@ export default function DataChartView({ connectionId, database, table }: Props) 
                     {t('chart.yAxis')}
                   </label>
                   <div className="flex flex-col gap-1">
+                    {chartData.length > 0 && chartData[0]?.['_count'] !== undefined && (
+                      <label className="flex cursor-pointer items-center gap-2 rounded bg-muted/30 px-1.5 py-1 text-xs hover:bg-muted/50">
+                        <input type="checkbox" checked={yAxes.includes('_count')} onChange={() => toggleYAxis('_count')} className="h-3.5 w-3.5 rounded border-input accent-primary" />
+                        <span className="truncate italic">_count (聚合计数)</span>
+                      </label>
+                    )}
                     {numericColumns.length > 0 ? (
                       numericColumns.map(col => (
                         <label

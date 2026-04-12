@@ -2,11 +2,21 @@ import { useTranslation } from 'react-i18next';
 import { useConnectionStore } from '@/stores/connectionStore';
 import { DB_TYPE_LABELS } from '@/types/database';
 import { cn } from '@/lib/utils';
+import { Button } from '@/components/ui/button';
+import { Languages } from 'lucide-react';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 import ThemeToggle from '@/components/ThemeToggle';
 import TaskPanel from '@/components/TaskPanel';
+import NotificationPanel from '@/components/NotificationPanel';
 
 export default function StatusBar() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const { activeConnectionId, connections, treeData } = useConnectionStore();
 
   const activeConn = connections.find((c) => c.id === activeConnectionId);
@@ -24,6 +34,26 @@ export default function StatusBar() {
       </div>
       <div className="ml-auto flex items-center gap-2">
         <TaskPanel />
+        <NotificationPanel />
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button variant="ghost" size="icon" className="h-7 w-7">
+              <Languages className="h-3.5 w-3.5" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end">
+            <DropdownMenuRadioGroup
+              value={i18n.language}
+              onValueChange={(v) => {
+                i18n.changeLanguage(v);
+                localStorage.setItem('astesia_language', v);
+              }}
+            >
+              <DropdownMenuRadioItem value="zh-CN">中文</DropdownMenuRadioItem>
+              <DropdownMenuRadioItem value="en-US">English</DropdownMenuRadioItem>
+            </DropdownMenuRadioGroup>
+          </DropdownMenuContent>
+        </DropdownMenu>
         <ThemeToggle />
         <span>{t('status.ready')}</span>
       </div>

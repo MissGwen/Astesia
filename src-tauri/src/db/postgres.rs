@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::{Column, Row};
 use std::time::Instant;
@@ -33,6 +34,16 @@ impl PostgresDriver {
 
     fn pool(&self) -> anyhow::Result<&PgPool> {
         self.pool.as_ref().ok_or_else(|| anyhow::anyhow!("Not connected"))
+    }
+
+    /// Parse a table reference that may be schema-qualified (e.g. "myschema.mytable").
+    /// Returns (schema, table_name). Defaults to "public" if no schema is specified.
+    fn parse_table_ref(table: &str) -> (&str, &str) {
+        if let Some(dot_pos) = table.find('.') {
+            (&table[..dot_pos], &table[dot_pos + 1..])
+        } else {
+            ("public", table)
+        }
     }
 
     /// Get a connection pool for a specific database. Returns the main pool
@@ -119,15 +130,18 @@ impl DatabaseDriver for PostgresDriver {
 
     async fn get_columns(&self, database: &str, table: &str) -> anyhow::Result<Vec<ColumnInfo>> {
         let pool = self.pool_for_db(database).await?;
+        let (schema, tbl) = Self::parse_table_ref(table);
         let sql = format!(
             "SELECT c.column_name, c.data_type, c.udt_name, c.is_nullable, c.column_default, \
              CASE WHEN tc.constraint_type = 'PRIMARY KEY' THEN true ELSE false END as is_pk \
              FROM information_schema.columns c \
-             LEFT JOIN information_schema.key_column_usage kcu ON c.column_name = kcu.column_name AND c.table_name = kcu.table_name \
-             LEFT JOIN information_schema.table_constraints tc ON kcu.constraint_name = tc.constraint_name AND tc.constraint_type = 'PRIMARY KEY' \
-             WHERE c.table_name = '{}' AND c.table_schema = 'public' \
+             LEFT JOIN information_schema.key_column_usage kcu \
+               ON c.column_name = kcu.column_name AND c.table_name = kcu.table_name AND c.table_schema = kcu.table_schema \
+             LEFT JOIN information_schema.table_constraints tc \
+               ON kcu.constraint_name = tc.constraint_name AND tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = kcu.table_schema \
+             WHERE c.table_name = '{}' AND c.table_schema = '{}' \
              ORDER BY c.ordinal_position",
-            table
+            tbl, schema
         );
         let rows: Vec<PgRow> = sqlx::query(&sql).fetch_all(&pool).await?;
         let columns = rows
@@ -153,12 +167,16 @@ impl DatabaseDriver for PostgresDriver {
 
     async fn get_indexes(&self, database: &str, table: &str) -> anyhow::Result<Vec<IndexInfo>> {
         let pool = self.pool_for_db(database).await?;
+        let (schema, tbl) = Self::parse_table_ref(table);
         let sql = format!(
             "SELECT i.relname as index_name, a.attname as column_name, ix.indisunique, ix.indisprimary \
-             FROM pg_class t, pg_class i, pg_index ix, pg_attribute a \
-             WHERE t.oid = ix.indrelid AND i.oid = ix.indexrelid AND a.attrelid = t.oid \
-             AND a.attnum = ANY(ix.indkey) AND t.relkind = 'r' AND t.relname = '{}'",
-            table
+             FROM pg_class t \
+             JOIN pg_namespace n ON t.relnamespace = n.oid \
+             JOIN pg_index ix ON t.oid = ix.indrelid \
+             JOIN pg_class i ON i.oid = ix.indexrelid \
+             JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(ix.indkey) \
+             WHERE t.relkind = 'r' AND t.relname = '{}' AND n.nspname = '{}'",
+            tbl, schema
         );
         let rows: Vec<PgRow> = sqlx::query(&sql).fetch_all(&pool).await?;
         let mut indexes: std::collections::HashMap<String, IndexInfo> = std::collections::HashMap::new();
@@ -214,9 +232,16 @@ impl DatabaseDriver for PostgresDriver {
                         .iter()
                         .enumerate()
                         .map(|(i, _)| {
-                            row.try_get::<String, _>(i)
-                                .map(serde_json::Value::String)
+                            row.try_get::<NaiveDateTime, _>(i)
+                                .map(|v| serde_json::Value::String(v.to_string()))
+                                .or_else(|_| row.try_get::<NaiveDate, _>(i)
+                                    .map(|v| serde_json::Value::String(v.to_string())))
+                                .or_else(|_| row.try_get::<NaiveTime, _>(i)
+                                    .map(|v| serde_json::Value::String(v.to_string())))
+                                .or_else(|_| row.try_get::<String, _>(i)
+                                    .map(serde_json::Value::String))
                                 .or_else(|_| row.try_get::<i64, _>(i).map(|v| serde_json::Value::Number(v.into())))
+                                .or_else(|_| row.try_get::<i32, _>(i).map(|v| serde_json::Value::Number(v.into())))
                                 .or_else(|_| row.try_get::<f64, _>(i).map(|v| {
                                     serde_json::Number::from_f64(v)
                                         .map(serde_json::Value::Number)
@@ -253,10 +278,11 @@ impl DatabaseDriver for PostgresDriver {
         page: u32,
         page_size: u32,
     ) -> anyhow::Result<QueryResult> {
+        let (schema, tbl) = Self::parse_table_ref(table);
         let offset = (page - 1) * page_size;
         let sql = format!(
-            "SELECT * FROM \"{}\" LIMIT {} OFFSET {}",
-            table, page_size, offset
+            "SELECT * FROM \"{}\".\"{}\" LIMIT {} OFFSET {}",
+            schema, tbl, page_size, offset
         );
         self.execute_query(database, &sql).await
     }
@@ -264,15 +290,20 @@ impl DatabaseDriver for PostgresDriver {
     async fn get_views(&self, database: &str) -> anyhow::Result<Vec<ViewInfo>> {
         let pool = self.pool_for_db(database).await?;
         let rows: Vec<PgRow> = sqlx::query(
-            "SELECT viewname, definition FROM pg_views WHERE schemaname = 'public'"
+            "SELECT viewname, definition, schemaname FROM pg_views \
+             WHERE schemaname NOT IN ('pg_catalog', 'information_schema')"
         )
         .fetch_all(&pool)
         .await?;
         let views = rows
             .iter()
-            .map(|row| ViewInfo {
-                name: row.get::<String, _>("viewname"),
-                definition: row.try_get::<String, _>("definition").ok(),
+            .map(|row| {
+                let schema: String = row.get("schemaname");
+                let name: String = row.get("viewname");
+                ViewInfo {
+                    name: format!("{}.{}", schema, name),
+                    definition: row.try_get::<String, _>("definition").ok(),
+                }
             })
             .collect();
         Ok(views)
@@ -281,21 +312,25 @@ impl DatabaseDriver for PostgresDriver {
     async fn get_functions(&self, database: &str) -> anyhow::Result<Vec<FunctionInfo>> {
         let pool = self.pool_for_db(database).await?;
         let rows: Vec<PgRow> = sqlx::query(
-            "SELECT p.proname, l.lanname, pg_get_function_result(p.oid) as return_type, pg_get_functiondef(p.oid) as definition \
+            "SELECT n.nspname, p.proname, l.lanname, pg_get_function_result(p.oid) as return_type, pg_get_functiondef(p.oid) as definition \
              FROM pg_proc p \
              JOIN pg_namespace n ON p.pronamespace = n.oid \
              JOIN pg_language l ON p.prolang = l.oid \
-             WHERE n.nspname = 'public' AND p.prokind = 'f'"
+             WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND p.prokind = 'f'"
         )
         .fetch_all(&pool)
         .await?;
         let functions = rows
             .iter()
-            .map(|row| FunctionInfo {
-                name: row.get::<String, _>("proname"),
-                language: row.try_get::<String, _>("lanname").ok(),
-                return_type: row.try_get::<String, _>("return_type").ok(),
-                definition: row.try_get::<String, _>("definition").ok(),
+            .map(|row| {
+                let schema: String = row.get("nspname");
+                let name: String = row.get("proname");
+                FunctionInfo {
+                    name: format!("{}.{}", schema, name),
+                    language: row.try_get::<String, _>("lanname").ok(),
+                    return_type: row.try_get::<String, _>("return_type").ok(),
+                    definition: row.try_get::<String, _>("definition").ok(),
+                }
             })
             .collect();
         Ok(functions)
@@ -304,20 +339,24 @@ impl DatabaseDriver for PostgresDriver {
     async fn get_procedures(&self, database: &str) -> anyhow::Result<Vec<ProcedureInfo>> {
         let pool = self.pool_for_db(database).await?;
         let rows: Vec<PgRow> = sqlx::query(
-            "SELECT p.proname, l.lanname, pg_get_functiondef(p.oid) as definition \
+            "SELECT n.nspname, p.proname, l.lanname, pg_get_functiondef(p.oid) as definition \
              FROM pg_proc p \
              JOIN pg_namespace n ON p.pronamespace = n.oid \
              JOIN pg_language l ON p.prolang = l.oid \
-             WHERE n.nspname = 'public' AND p.prokind = 'p'"
+             WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND p.prokind = 'p'"
         )
         .fetch_all(&pool)
         .await?;
         let procedures = rows
             .iter()
-            .map(|row| ProcedureInfo {
-                name: row.get::<String, _>("proname"),
-                language: row.try_get::<String, _>("lanname").ok(),
-                definition: row.try_get::<String, _>("definition").ok(),
+            .map(|row| {
+                let schema: String = row.get("nspname");
+                let name: String = row.get("proname");
+                ProcedureInfo {
+                    name: format!("{}.{}", schema, name),
+                    language: row.try_get::<String, _>("lanname").ok(),
+                    definition: row.try_get::<String, _>("definition").ok(),
+                }
             })
             .collect();
         Ok(procedures)
@@ -326,18 +365,23 @@ impl DatabaseDriver for PostgresDriver {
     async fn get_triggers(&self, database: &str) -> anyhow::Result<Vec<TriggerInfo>> {
         let pool = self.pool_for_db(database).await?;
         let rows: Vec<PgRow> = sqlx::query(
-            "SELECT trigger_name, event_manipulation, event_object_table, action_timing \
-             FROM information_schema.triggers WHERE trigger_schema = 'public'"
+            "SELECT trigger_schema, trigger_name, event_manipulation, event_object_table, action_timing \
+             FROM information_schema.triggers \
+             WHERE trigger_schema NOT IN ('pg_catalog', 'information_schema')"
         )
         .fetch_all(&pool)
         .await?;
         let triggers = rows
             .iter()
-            .map(|row| TriggerInfo {
-                name: row.get::<String, _>("trigger_name"),
-                event: row.get::<String, _>("event_manipulation"),
-                table: row.get::<String, _>("event_object_table"),
-                timing: row.get::<String, _>("action_timing"),
+            .map(|row| {
+                let schema: String = row.get("trigger_schema");
+                let name: String = row.get("trigger_name");
+                TriggerInfo {
+                    name: format!("{}.{}", schema, name),
+                    event: row.get::<String, _>("event_manipulation"),
+                    table: row.get::<String, _>("event_object_table"),
+                    timing: row.get::<String, _>("action_timing"),
+                }
             })
             .collect();
         Ok(triggers)
@@ -345,6 +389,7 @@ impl DatabaseDriver for PostgresDriver {
 
     async fn get_foreign_keys(&self, database: &str, table: &str) -> anyhow::Result<Vec<ForeignKeyInfo>> {
         let pool = self.pool_for_db(database).await?;
+        let (schema, tbl) = Self::parse_table_ref(table);
         let sql = format!(
             "SELECT tc.constraint_name, kcu.table_name, kcu.column_name, \
              ccu.table_name AS referenced_table, ccu.column_name AS referenced_column \
@@ -353,8 +398,8 @@ impl DatabaseDriver for PostgresDriver {
                ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema \
              JOIN information_schema.constraint_column_usage ccu \
                ON ccu.constraint_name = tc.constraint_name AND ccu.table_schema = tc.table_schema \
-             WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_name = '{}'",
-            table
+             WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_name = '{}' AND tc.table_schema = '{}'",
+            tbl, schema
         );
         let rows: Vec<PgRow> = sqlx::query(&sql).fetch_all(&pool).await?;
         let mut fk_map: std::collections::HashMap<String, ForeignKeyInfo> = std::collections::HashMap::new();
@@ -365,7 +410,7 @@ impl DatabaseDriver for PostgresDriver {
             let to_col: String = row.get("referenced_column");
             let entry = fk_map.entry(name.clone()).or_insert_with(|| ForeignKeyInfo {
                 name: name.clone(),
-                from_table: table.to_string(),
+                from_table: tbl.to_string(),
                 from_columns: vec![],
                 to_table: to_table.clone(),
                 to_columns: vec![],
@@ -379,18 +424,33 @@ impl DatabaseDriver for PostgresDriver {
     async fn get_users(&self) -> anyhow::Result<Vec<UserInfo>> {
         let pool = self.pool()?;
         let rows: Vec<PgRow> = sqlx::query(
-            "SELECT rolname FROM pg_roles WHERE rolcanlogin = true"
+            "SELECT rolname, rolcanlogin, rolsuper, rolcreaterole, rolcreatedb \
+             FROM pg_roles WHERE rolname NOT LIKE 'pg_%' ORDER BY rolname"
         )
         .fetch_all(pool)
         .await?;
         let users = rows
             .iter()
-            .map(|row| UserInfo {
-                name: row.get::<String, _>("rolname"),
-                host: None,
+            .map(|row| {
+                let name: String = row.get("rolname");
+                let can_login: bool = row.try_get::<bool, _>("rolcanlogin").unwrap_or(false);
+                UserInfo {
+                    name,
+                    host: Some(if can_login { "user".to_string() } else { "group".to_string() }),
+                }
             })
             .collect();
         Ok(users)
+    }
+
+    async fn get_schemas(&self, database: &str) -> anyhow::Result<Vec<String>> {
+        let pool = self.pool_for_db(database).await?;
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT schema_name FROM information_schema.schemata ORDER BY schema_name"
+        )
+        .fetch_all(&pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| r.0).collect())
     }
 
     async fn get_enum_values(&self, database: &str, enum_type: &str) -> anyhow::Result<Vec<String>> {
@@ -405,11 +465,18 @@ impl DatabaseDriver for PostgresDriver {
 
     async fn get_create_table_sql(&self, database: &str, table: &str) -> anyhow::Result<String> {
         let pool = self.pool_for_db(database).await?;
+        let (schema, tbl) = Self::parse_table_ref(table);
         // Get columns
-        let col_sql = format!("SELECT column_name, data_type, is_nullable, column_default, character_maximum_length FROM information_schema.columns WHERE table_name = '{}' AND table_schema = 'public' ORDER BY ordinal_position", table);
+        let col_sql = format!(
+            "SELECT column_name, data_type, is_nullable, column_default, character_maximum_length \
+             FROM information_schema.columns \
+             WHERE table_name = '{}' AND table_schema = '{}' \
+             ORDER BY ordinal_position",
+            tbl, schema
+        );
         let col_rows: Vec<PgRow> = sqlx::query(&col_sql).fetch_all(&pool).await?;
 
-        let mut ddl = format!("CREATE TABLE \"{}\" (\n", table);
+        let mut ddl = format!("CREATE TABLE \"{}\".\"{}\" (\n", schema, tbl);
         let mut col_defs = Vec::new();
         for row in &col_rows {
             let name: String = row.get("column_name");
@@ -422,7 +489,13 @@ impl DatabaseDriver for PostgresDriver {
             col_defs.push(col_def);
         }
         // Get primary key
-        let pk_sql = format!("SELECT kcu.column_name FROM information_schema.table_constraints tc JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name WHERE tc.table_name = '{}' AND tc.constraint_type = 'PRIMARY KEY'", table);
+        let pk_sql = format!(
+            "SELECT kcu.column_name \
+             FROM information_schema.table_constraints tc \
+             JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema \
+             WHERE tc.table_name = '{}' AND tc.table_schema = '{}' AND tc.constraint_type = 'PRIMARY KEY'",
+            tbl, schema
+        );
         let pk_rows: Vec<PgRow> = sqlx::query(&pk_sql).fetch_all(&pool).await?;
         if !pk_rows.is_empty() {
             let pk_cols: Vec<String> = pk_rows.iter().map(|r| format!("\"{}\"", r.get::<String, _>("column_name"))).collect();

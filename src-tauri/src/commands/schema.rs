@@ -69,6 +69,22 @@ pub async fn get_indexes(
 }
 
 #[tauri::command]
+pub async fn get_schemas(
+    state: State<'_, AppState>,
+    connection_id: String,
+    database: String,
+) -> Result<Vec<String>, String> {
+    let connections = state.connections.lock().await;
+    let driver = connections
+        .get(&connection_id)
+        .ok_or_else(|| "连接不存在".to_string())?;
+    driver
+        .get_schemas(&database)
+        .await
+        .map_err(|e| format!("获取Schema列表失败: {}", e))
+}
+
+#[tauri::command]
 pub async fn get_enum_values(
     state: State<'_, AppState>,
     connection_id: String,

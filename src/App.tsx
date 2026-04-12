@@ -3,7 +3,10 @@ import AppLayout from './components/Layout';
 import { useConnectionStore } from './stores/connectionStore';
 import { useThemeStore } from './stores/themeStore';
 import { useClipboardStore } from './stores/clipboardStore';
-import './i18n';
+import { ToastContainer } from './components/ui/toast';
+import CreateResourceDialog from './components/CreateResourceDialog';
+import ConfirmDialog from './components/ConfirmDialog';
+import i18n from './i18n';
 import './styles/global.css';
 
 function App() {
@@ -12,6 +15,8 @@ function App() {
 
   useEffect(() => {
     const cleanupTheme = initTheme();
+    const savedLang = localStorage.getItem('astesia_language');
+    if (savedLang) i18n.changeLanguage(savedLang);
     const saved = localStorage.getItem('astesia_connections');
     if (saved) {
       try {
@@ -32,6 +37,17 @@ function App() {
       cleanupTheme();
     };
   }, [setConnections, initTheme]);
+
+  // Disable Tauri default context menu globally
+  // Radix ContextMenu intercepts right-click at higher priority, so custom
+  // context menus still work. This only suppresses the native menu elsewhere.
+  useEffect(() => {
+    const handleContextMenu = (e: MouseEvent) => {
+      e.preventDefault();
+    };
+    document.addEventListener('contextmenu', handleContextMenu);
+    return () => document.removeEventListener('contextmenu', handleContextMenu);
+  }, []);
 
   // Global keyboard shortcuts
   useEffect(() => {
@@ -57,7 +73,14 @@ function App() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, []);
 
-  return <AppLayout />;
+  return (
+    <>
+      <AppLayout />
+      <ToastContainer />
+      <CreateResourceDialog />
+      <ConfirmDialog />
+    </>
+  );
 }
 
 export default App;

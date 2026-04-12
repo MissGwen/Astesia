@@ -1,10 +1,12 @@
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
 import { ConnectionConfig, ConnectionResult, FunctionInfo, ProcedureInfo, TableInfo, TriggerInfo, UserInfo, ViewInfo } from '@/types/database';
+import { notify } from '@/stores/notificationStore';
 
 interface TreeNode {
   connectionId: string;
   databases: string[];
+  schemas: Record<string, string[]>;
   tables: Record<string, TableInfo[]>;
   views: Record<string, ViewInfo[]>;
   functions: Record<string, FunctionInfo[]>;
@@ -31,6 +33,7 @@ interface ConnectionStore {
   testConnection: (config: ConnectionConfig) => Promise<ConnectionResult>;
 
   loadDatabases: (connectionId: string) => Promise<void>;
+  loadSchemas: (connectionId: string, database: string) => Promise<void>;
   loadTables: (connectionId: string, database: string) => Promise<void>;
   loadViews: (connectionId: string, database: string) => Promise<void>;
   loadFunctions: (connectionId: string, database: string) => Promise<void>;
@@ -83,6 +86,7 @@ export const useConnectionStore = create<ConnectionStore>((set, get) => ({
           [id]: {
             connectionId: id,
             databases: [],
+            schemas: {},
             tables: {},
             views: {},
             functions: {},
@@ -96,6 +100,8 @@ export const useConnectionStore = create<ConnectionStore>((set, get) => ({
         activeConnectionId: id,
       }));
       await get().loadDatabases(id);
+    } else {
+      notify.error('连接失败', result.message);
     }
     return result;
   },
@@ -131,8 +137,33 @@ export const useConnectionStore = create<ConnectionStore>((set, get) => ({
           },
         },
       }));
-    } catch (e) {
+    } catch (e: any) {
       console.error('Failed to load databases:', e);
+      notify.error('加载数据库失败', typeof e === 'string' ? e : String(e));
+    }
+  },
+
+  loadSchemas: async (connectionId, database) => {
+    try {
+      const schemas = await invoke<string[]>('get_schemas', {
+        connectionId,
+        database,
+      });
+      set((state) => ({
+        treeData: {
+          ...state.treeData,
+          [connectionId]: {
+            ...state.treeData[connectionId],
+            schemas: {
+              ...state.treeData[connectionId]?.schemas,
+              [database]: schemas,
+            },
+          },
+        },
+      }));
+    } catch (e: any) {
+      console.error('Failed to load schemas:', e);
+      notify.error('加载Schema失败', typeof e === 'string' ? e : String(e));
     }
   },
 
@@ -154,8 +185,9 @@ export const useConnectionStore = create<ConnectionStore>((set, get) => ({
           },
         },
       }));
-    } catch (e) {
+    } catch (e: any) {
       console.error('Failed to load tables:', e);
+      notify.error('加载表失败', typeof e === 'string' ? e : String(e));
     }
   },
 
@@ -174,8 +206,9 @@ export const useConnectionStore = create<ConnectionStore>((set, get) => ({
           },
         },
       }));
-    } catch (e) {
+    } catch (e: any) {
       console.error('Failed to load views:', e);
+      notify.error('加载视图失败', typeof e === 'string' ? e : String(e));
     }
   },
 
@@ -194,8 +227,9 @@ export const useConnectionStore = create<ConnectionStore>((set, get) => ({
           },
         },
       }));
-    } catch (e) {
+    } catch (e: any) {
       console.error('Failed to load functions:', e);
+      notify.error('加载函数失败', typeof e === 'string' ? e : String(e));
     }
   },
 
@@ -214,8 +248,9 @@ export const useConnectionStore = create<ConnectionStore>((set, get) => ({
           },
         },
       }));
-    } catch (e) {
+    } catch (e: any) {
       console.error('Failed to load procedures:', e);
+      notify.error('加载存储过程失败', typeof e === 'string' ? e : String(e));
     }
   },
 
@@ -234,8 +269,9 @@ export const useConnectionStore = create<ConnectionStore>((set, get) => ({
           },
         },
       }));
-    } catch (e) {
+    } catch (e: any) {
       console.error('Failed to load triggers:', e);
+      notify.error('加载触发器失败', typeof e === 'string' ? e : String(e));
     }
   },
 
@@ -251,8 +287,9 @@ export const useConnectionStore = create<ConnectionStore>((set, get) => ({
           },
         },
       }));
-    } catch (e) {
+    } catch (e: any) {
       console.error('Failed to load users:', e);
+      notify.error('加载用户失败', typeof e === 'string' ? e : String(e));
     }
   },
 

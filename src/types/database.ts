@@ -88,7 +88,7 @@ export interface UserInfo {
 export interface TabItem {
   key: string;
   label: string;
-  type: 'query' | 'table-data' | 'table-structure' | 'view-definition' | 'function-definition' | 'procedure-definition' | 'er-diagram' | 'performance' | 'data-chart';
+  type: 'query' | 'table-data' | 'table-structure' | 'view-definition' | 'function-definition' | 'procedure-definition' | 'er-diagram' | 'performance' | 'data-chart' | 'redis-viewer' | 'mongo-viewer';
   connectionId: string;
   database: string;
   table?: string;

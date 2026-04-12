@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions, SqliteRow};
 use sqlx::{Column, Row};
 use std::time::Instant;
@@ -150,9 +151,16 @@ impl DatabaseDriver for SqliteDriver {
                         .iter()
                         .enumerate()
                         .map(|(i, _)| {
-                            row.try_get::<String, _>(i)
-                                .map(serde_json::Value::String)
+                            row.try_get::<NaiveDateTime, _>(i)
+                                .map(|v| serde_json::Value::String(v.to_string()))
+                                .or_else(|_| row.try_get::<NaiveDate, _>(i)
+                                    .map(|v| serde_json::Value::String(v.to_string())))
+                                .or_else(|_| row.try_get::<NaiveTime, _>(i)
+                                    .map(|v| serde_json::Value::String(v.to_string())))
+                                .or_else(|_| row.try_get::<String, _>(i)
+                                    .map(serde_json::Value::String))
                                 .or_else(|_| row.try_get::<i64, _>(i).map(|v| serde_json::Value::Number(v.into())))
+                                .or_else(|_| row.try_get::<i32, _>(i).map(|v| serde_json::Value::Number(v.into())))
                                 .or_else(|_| row.try_get::<f64, _>(i).map(|v| {
                                     serde_json::Number::from_f64(v)
                                         .map(serde_json::Value::Number)

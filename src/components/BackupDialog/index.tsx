@@ -8,6 +8,7 @@ import {
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
 import { TableInfo } from '@/types/database';
+import { notify } from '@/stores/notificationStore';
 
 interface BackupDialogProps {
   open: boolean;
@@ -79,9 +80,11 @@ export default function BackupDialog({ open, onClose, connectionId, database }: 
           output_path: outputPath,
         },
       });
+      notify.success(t('backup.title'), t('backup.success'));
       onClose();
     } catch (e) {
       console.error('Backup failed:', e);
+      notify.error(t('backup.title'), String(e));
     } finally {
       setLoading(false);
     }

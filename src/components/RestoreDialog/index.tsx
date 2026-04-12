@@ -7,6 +7,7 @@ import {
 } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
+import { notify } from '@/stores/notificationStore';
 
 interface RestoreDialogProps {
   open: boolean;
@@ -39,9 +40,11 @@ export default function RestoreDialog({ open: isOpen, onClose, connectionId, dat
         database,
         filePath,
       });
+      notify.success(t('backup.restore'), t('backup.success'));
       onClose();
     } catch (e) {
       console.error('Restore failed:', e);
+      notify.error(t('backup.restore'), String(e));
     } finally {
       setLoading(false);
     }

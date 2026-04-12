@@ -1,27 +1,43 @@
 import { useState, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
+import { invoke } from '@tauri-apps/api/core';
 import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Tooltip, TooltipContent, TooltipTrigger, TooltipProvider } from '@/components/ui/tooltip';
 import {
   ContextMenu, ContextMenuContent, ContextMenuItem,
   ContextMenuSeparator, ContextMenuTrigger,
 } from '@/components/ui/context-menu';
+import {
+  Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription,
+} from '@/components/ui/dialog';
+import { Label } from '@/components/ui/label';
 import { useConnectionStore } from '@/stores/connectionStore';
+import { notify } from '@/stores/notificationStore';
+import { confirm } from '@/stores/confirmStore';
 import { useClipboardStore } from '@/stores/clipboardStore';
 import { useTabStore } from '@/stores/tabStore';
 import { ConnectionConfig, DB_TYPE_LABELS, DB_TYPE_COLORS, DbType } from '@/types/database';
 import ConnectionDialog from '../ConnectionDialog';
 import CopyTableDialog from '../CopyTableDialog';
 import {
-  Plus, Database, Table2, ChevronRight, ChevronDown,
-  Unplug, RefreshCw, Trash2, Pencil, Code, Eye, Columns,
-  FunctionSquare, Workflow, Zap, Users, Download, Upload,
-  Copy, ClipboardPaste, BarChart3,
+  Plus, Database, ChevronRight, ChevronDown,
+  Code, Eye, Users, Download, Upload,
+  ClipboardPaste, RefreshCw, Zap, Trash2,
+  Table2, FunctionSquare, Workflow, Layers,
 } from 'lucide-react';
+import { Badge } from '@/components/ui/badge';
 import { cn } from '@/lib/utils';
 import BackupDialog from '../BackupDialog';
 import RestoreDialog from '../RestoreDialog';
+
+import { useCreateResourceStore } from '@/stores/createResourceStore';
+import ConnectionNode from './ConnectionNode';
+import PostgresTree from './trees/PostgresTree';
+import SqlDatabaseTree from './trees/SqlDatabaseTree';
+import RedisTree from './trees/RedisTree';
+import MongoTree from './trees/MongoTree';
 
 export default function Sidebar() {
   const { t } = useTranslation();
@@ -34,12 +50,17 @@ export default function Sidebar() {
   const [copySource, setCopySource] = useState<{ connectionId: string; database: string; tableName: string; dbType: DbType } | null>(null);
   const [copyTarget, setCopyTarget] = useState<{ connectionId: string; database: string } | null>(null);
   const [dragOverDbKey, setDragOverDbKey] = useState<string | null>(null);
-
+  const [redisKeyFilter, setRedisKeyFilter] = useState<Record<string, string>>({});
+  const [redisAddKeyDialog, setRedisAddKeyDialog] = useState<{ connectionId: string; database: string } | null>(null);
+  const [redisNewKey, setRedisNewKey] = useState('');
+  const [redisNewValue, setRedisNewValue] = useState('');
+  const [redisNewTTL, setRedisNewTTL] = useState('');
   const clipboardStore = useClipboardStore();
+  const { openDialog } = useCreateResourceStore();
 
   const {
     connections, treeData, connectDatabase, disconnectDatabase,
-    removeConnection, loadTables, loadDatabases,
+    removeConnection, loadTables, loadDatabases, loadSchemas,
     loadViews, loadFunctions, loadProcedures, loadTriggers, loadUsers,
   } = useConnectionStore();
   const { addTab } = useTabStore();
@@ -63,7 +84,7 @@ export default function Sidebar() {
   const handleOpenQuery = (connectionId: string, database: string) => {
     addTab({
       key: `query-${connectionId}-${database}-${Date.now()}`,
-      label: `查询 - ${database}`,
+      label: `查询 [${database}]`,
       type: 'query',
       connectionId,
       database,
@@ -71,9 +92,11 @@ export default function Sidebar() {
   };
 
   const handleViewData = (connectionId: string, database: string, table: string) => {
+    const tableParts = table.includes('.') ? table.split('.') : [table];
+    const displayName = tableParts[tableParts.length - 1];
     addTab({
       key: `data-${connectionId}-${database}-${table}`,
-      label: table,
+      label: `${displayName} [${database}]`,
       type: 'table-data',
       connectionId,
       database,
@@ -82,9 +105,11 @@ export default function Sidebar() {
   };
 
   const handleViewStructure = (connectionId: string, database: string, table: string) => {
+    const tableParts = table.includes('.') ? table.split('.') : [table];
+    const displayName = tableParts[tableParts.length - 1];
     addTab({
       key: `structure-${connectionId}-${database}-${table}`,
-      label: `${table} [结构]`,
+      label: `${displayName} [结构] [${database}]`,
       type: 'table-structure',
       connectionId,
       database,
@@ -93,9 +118,11 @@ export default function Sidebar() {
   };
 
   const handleViewChart = (connectionId: string, database: string, table: string) => {
+    const tableParts = table.includes('.') ? table.split('.') : [table];
+    const displayName = tableParts[tableParts.length - 1];
     addTab({
       key: `chart-${connectionId}-${database}-${table}`,
-      label: `${table} [图表]`,
+      label: `${displayName} [图表] [${database}]`,
       type: 'data-chart',
       connectionId,
       database,
@@ -105,9 +132,11 @@ export default function Sidebar() {
 
   const handleOpenObjectDef = (connectionId: string, database: string, objectName: string, objectType: 'view' | 'function' | 'procedure') => {
     const typeLabel = objectType === 'view' ? '视图' : objectType === 'function' ? '函数' : '存储过程';
+    const nameParts = objectName.includes('.') ? objectName.split('.') : [objectName];
+    const displayName = nameParts[nameParts.length - 1];
     addTab({
       key: `${objectType}-def-${connectionId}-${database}-${objectName}`,
-      label: `${objectName} [${typeLabel}]`,
+      label: `${displayName} [${typeLabel}] [${database}]`,
       type: `${objectType}-definition` as 'view-definition' | 'function-definition' | 'procedure-definition',
       connectionId,
       database,
@@ -115,24 +144,70 @@ export default function Sidebar() {
     });
   };
 
-  const handleOpenERDiagram = (connectionId: string, database: string) => {
+  const handleOpenERDiagram = (connectionId: string, database: string, schema?: string) => {
+    const suffix = schema ? `${database}.${schema}` : database;
     addTab({
-      key: `er-${connectionId}-${database}`,
-      label: `ER 图 - ${database}`,
+      key: `er-${connectionId}-${database}-${schema || 'all'}`,
+      label: `ER 图 [${suffix}]`,
       type: 'er-diagram',
       connectionId,
       database,
+      table: schema,
     });
   };
 
   const handleOpenPerformance = (connectionId: string, database: string) => {
     addTab({
       key: `perf-${connectionId}-${database}`,
-      label: `性能 - ${database}`,
+      label: `性能 [${database}]`,
       type: 'performance',
       connectionId,
       database,
     });
+  };
+
+  const handleViewRedisKey = (connectionId: string, database: string, keyName: string) => {
+    addTab({
+      key: `redis-${connectionId}-${database}-${keyName}`,
+      label: `${keyName} [${database}]`,
+      type: 'redis-viewer',
+      connectionId,
+      database,
+      table: keyName,
+    });
+  };
+
+  const handleRedisDeleteKey = async (connectionId: string, database: string, keyName: string) => {
+    const ok = await confirm(t('redis.deleteKey'), t('redis.confirmDelete'));
+    if (!ok) return;
+    try {
+      await invoke('redis_delete_key', { connectionId, database, key: keyName });
+      await loadTables(connectionId, database);
+    } catch (err: any) {
+      console.error('Failed to delete Redis key:', err);
+    }
+  };
+
+  const handleRedisAddKey = async () => {
+    if (!redisAddKeyDialog || !redisNewKey.trim()) return;
+    const { connectionId, database } = redisAddKeyDialog;
+    try {
+      const ttlVal = redisNewTTL ? parseInt(redisNewTTL) : undefined;
+      await invoke('redis_set_key', {
+        connectionId,
+        database,
+        key: redisNewKey,
+        value: redisNewValue || '""',
+        ttl: ttlVal && ttlVal > 0 ? ttlVal : null,
+      });
+      await loadTables(connectionId, database);
+      setRedisAddKeyDialog(null);
+      setRedisNewKey('');
+      setRedisNewValue('');
+      setRedisNewTTL('');
+    } catch (err: any) {
+      console.error('Failed to add Redis key:', err);
+    }
   };
 
   return (
@@ -179,120 +254,41 @@ export default function Sidebar() {
                 {connections.map((conn) => {
                   const node = treeData[conn.id];
                   const isConnected = node?.connected;
-                  const color = conn.color || DB_TYPE_COLORS[conn.db_type];
                   const isExpanded = expandedKeys.has(conn.id);
 
                   return (
                     <div key={conn.id}>
                       {/* Connection Node */}
-                      <ContextMenu>
-                        <ContextMenuTrigger asChild>
-                          <button
-                            className={cn(
-                              "flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-sm transition-colors hover:bg-sidebar-accent",
-                              isConnected && "font-medium"
-                            )}
-                            onClick={async () => {
-                              if (!isConnected) {
-                                await handleConnect(conn);
-                              } else {
-                                toggleExpand(conn.id);
-                              }
-                            }}
-                          >
-                            {isConnected ? (
-                              isExpanded
-                                ? <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                                : <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                            ) : (
-                              <span className="w-3.5 shrink-0" />
-                            )}
-                            <span
-                              className="h-2.5 w-2.5 shrink-0 rounded-full"
-                              style={{ background: isConnected ? '#22c55e' : color }}
-                            />
-                            <Database className="h-4 w-4 shrink-0" style={{ color }} />
-                            <span className="truncate">{conn.name}</span>
-                            <span className="ml-auto pl-2 text-[10px] text-muted-foreground">
-                              {DB_TYPE_LABELS[conn.db_type]}
-                            </span>
-                          </button>
-                        </ContextMenuTrigger>
-                        <ContextMenuContent className="w-48">
-                          {isConnected && (
-                            <>
-                              <ContextMenuItem
-                                className="gap-2 py-2"
-                                onClick={() => handleOpenQuery(conn.id, node?.databases?.[0] || '')}
-                              >
-                                <Code className="h-4 w-4" /> {t('sidebar.openQuery')}
-                              </ContextMenuItem>
-                              <ContextMenuItem
-                                className="gap-2 py-2"
-                                onClick={() => loadDatabases(conn.id)}
-                              >
-                                <RefreshCw className="h-4 w-4" /> {t('sidebar.refresh')}
-                              </ContextMenuItem>
-                              <ContextMenuSeparator />
-                              <ContextMenuItem
-                                className="gap-2 py-2"
-                                onClick={() => disconnectDatabase(conn.id)}
-                              >
-                                <Unplug className="h-4 w-4" /> {t('sidebar.disconnect')}
-                              </ContextMenuItem>
-                              <ContextMenuSeparator />
-                            </>
-                          )}
-                          <ContextMenuItem
-                            className="gap-2 py-2"
-                            onClick={() => { setEditConfig(conn); setDialogOpen(true); }}
-                          >
-                            <Pencil className="h-4 w-4" /> {t('common.edit')}
-                          </ContextMenuItem>
-                          <ContextMenuSeparator />
-                          <ContextMenuItem
-                            className="gap-2 py-2 text-destructive focus:text-destructive"
-                            onClick={() => {
-                              if (treeData[conn.id]?.connected) disconnectDatabase(conn.id);
-                              removeConnection(conn.id);
-                            }}
-                          >
-                            <Trash2 className="h-4 w-4" /> {t('common.delete')}
-                          </ContextMenuItem>
-                        </ContextMenuContent>
-                      </ContextMenu>
+                      <ConnectionNode
+                        conn={conn}
+                        isConnected={!!isConnected}
+                        isExpanded={isExpanded}
+                        node={node}
+                        onConnect={handleConnect}
+                        onToggleExpand={toggleExpand}
+                        onOpenQuery={handleOpenQuery}
+                        onRefresh={loadDatabases}
+                        onDisconnect={disconnectDatabase}
+                        onEdit={(c) => { setEditConfig(c); setDialogOpen(true); }}
+                        onDelete={(c) => {
+                          if (treeData[c.id]?.connected) disconnectDatabase(c.id);
+                          removeConnection(c.id);
+                        }}
+                      />
 
                       {/* Databases */}
                       {isConnected && isExpanded && (node?.databases || []).map((db) => {
                         const dbKey = `${conn.id}::${db}`;
                         const dbExpanded = expandedKeys.has(dbKey);
 
-                        const tables = node?.tables?.[db] || [];
-                        const views = node?.views?.[db] || [];
-                        const functions = node?.functions?.[db] || [];
-                        const procedures = node?.procedures?.[db] || [];
-                        const triggers = node?.triggers?.[db] || [];
-
-                        const tablesKey = `${dbKey}::tables`;
-                        const viewsKey = `${dbKey}::views`;
-                        const functionsKey = `${dbKey}::functions`;
-                        const proceduresKey = `${dbKey}::procedures`;
-                        const triggersKey = `${dbKey}::triggers`;
-
-                        const tablesExpanded = expandedKeys.has(tablesKey);
-                        const viewsExpanded = expandedKeys.has(viewsKey);
-                        const functionsExpanded = expandedKeys.has(functionsKey);
-                        const proceduresExpanded = expandedKeys.has(proceduresKey);
-                        const triggersExpanded = expandedKeys.has(triggersKey);
-
-                        // Redis/MongoDB don't have SQL object categories
-                        const isSQL = conn.db_type !== 'redis' && conn.db_type !== 'mongodb';
+                        const isPG = conn.db_type === 'postgresql';
                         const isRedis = conn.db_type === 'redis';
                         const isMongo = conn.db_type === 'mongodb';
-                        const tableLabel = isRedis ? '键' : isMongo ? '集合' : t('sidebar.tables');
+                        const isSQL = !isRedis && !isMongo;
 
                         return (
                           <div key={dbKey}>
+                            {/* Database node with context menu */}
                             <ContextMenu>
                               <ContextMenuTrigger asChild>
                                 <button
@@ -303,7 +299,11 @@ export default function Sidebar() {
                                   onClick={async () => {
                                     toggleExpand(dbKey);
                                     if (!dbExpanded) {
-                                      await loadTables(conn.id, db);
+                                      if (isPG) {
+                                        await loadSchemas(conn.id, db);
+                                      } else {
+                                        await loadTables(conn.id, db);
+                                      }
                                     }
                                   }}
                                   onDragOver={(e) => {
@@ -336,173 +336,206 @@ export default function Sidebar() {
                                 </button>
                               </ContextMenuTrigger>
                               <ContextMenuContent className="w-44">
-                                <ContextMenuItem className="gap-2 py-2" onClick={() => handleOpenQuery(conn.id, db)}>
-                                  <Code className="h-4 w-4" /> {t('sidebar.openQuery')}
-                                </ContextMenuItem>
-                                <ContextMenuItem className="gap-2 py-2" onClick={() => handleOpenERDiagram(conn.id, db)}>
-                                  <Eye className="h-4 w-4" /> {t('sidebar.erDiagram')}
-                                </ContextMenuItem>
-                                <ContextMenuItem className="gap-2 py-2" onClick={() => handleOpenPerformance(conn.id, db)}>
-                                  <Zap className="h-4 w-4" /> {t('sidebar.performance')}
-                                </ContextMenuItem>
-                                <ContextMenuSeparator />
-                                <ContextMenuItem className="gap-2 py-2" onClick={() => setBackupTarget({ connectionId: conn.id, database: db })}>
-                                  <Download className="h-4 w-4" /> {t('backup.title')}
-                                </ContextMenuItem>
-                                <ContextMenuItem className="gap-2 py-2" onClick={() => setRestoreTarget({ connectionId: conn.id, database: db })}>
-                                  <Upload className="h-4 w-4" /> {t('backup.restore')}
-                                </ContextMenuItem>
-                                {clipboardStore.copiedTable && clipboardStore.copiedTable.dbType === conn.db_type && (
+                                {isRedis ? (
                                   <>
+                                    <ContextMenuItem className="gap-2 py-2" onClick={() => setRedisAddKeyDialog({ connectionId: conn.id, database: db })}>
+                                      <Plus className="h-4 w-4" /> {t('redis.addKey')}
+                                    </ContextMenuItem>
+                                    <ContextMenuItem className="gap-2 py-2" onClick={() => handleOpenQuery(conn.id, db)}>
+                                      <Code className="h-4 w-4" /> {t('sidebar.openQuery')}
+                                    </ContextMenuItem>
+                                    <ContextMenuItem className="gap-2 py-2" onClick={() => handleOpenPerformance(conn.id, db)}>
+                                      <Zap className="h-4 w-4" /> {t('sidebar.performance')}
+                                    </ContextMenuItem>
+                                    <ContextMenuSeparator />
+                                    <ContextMenuItem className="gap-2 py-2" onClick={() => loadTables(conn.id, db)}>
+                                      <RefreshCw className="h-4 w-4" /> {t('sidebar.refresh')}
+                                    </ContextMenuItem>
+                                  </>
+                                ) : (
+                                  <>
+                                    {isPG ? (
+                                      <>
+                                        <ContextMenuItem className="gap-2 py-2" onClick={() => openDialog('schema', conn.id, db, undefined, conn.db_type)}>
+                                          <Layers className="h-4 w-4" /> {t('sidebar.newSchema')}
+                                        </ContextMenuItem>
+                                        <ContextMenuSeparator />
+                                      </>
+                                    ) : (
+                                      <>
+                                        <ContextMenuItem className="gap-2 py-2" onClick={() => openDialog('table', conn.id, db, undefined, conn.db_type)}>
+                                          <Table2 className="h-4 w-4" /> {t('sidebar.newTable')}
+                                        </ContextMenuItem>
+                                        <ContextMenuItem className="gap-2 py-2" onClick={() => openDialog('view', conn.id, db, undefined, conn.db_type)}>
+                                          <Eye className="h-4 w-4" /> {t('sidebar.newView')}
+                                        </ContextMenuItem>
+                                        <ContextMenuItem className="gap-2 py-2" onClick={() => openDialog('function', conn.id, db, undefined, conn.db_type)}>
+                                          <FunctionSquare className="h-4 w-4" /> {t('sidebar.newFunction')}
+                                        </ContextMenuItem>
+                                        <ContextMenuItem className="gap-2 py-2" onClick={() => openDialog('procedure', conn.id, db, undefined, conn.db_type)}>
+                                          <Workflow className="h-4 w-4" /> {t('sidebar.newProcedure')}
+                                        </ContextMenuItem>
+                                        <ContextMenuItem className="gap-2 py-2" onClick={() => openDialog('trigger', conn.id, db, undefined, conn.db_type)}>
+                                          <Zap className="h-4 w-4" /> {t('sidebar.newTrigger')}
+                                        </ContextMenuItem>
+                                        <ContextMenuSeparator />
+                                      </>
+                                    )}
+                                    <ContextMenuItem className="gap-2 py-2" onClick={() => handleOpenQuery(conn.id, db)}>
+                                      <Code className="h-4 w-4" /> {t('sidebar.openQuery')}
+                                    </ContextMenuItem>
+                                    <ContextMenuItem className="gap-2 py-2" onClick={() => handleOpenERDiagram(conn.id, db)}>
+                                      <Eye className="h-4 w-4" /> {t('sidebar.erDiagram')}
+                                    </ContextMenuItem>
+                                    <ContextMenuItem className="gap-2 py-2" onClick={() => handleOpenPerformance(conn.id, db)}>
+                                      <Zap className="h-4 w-4" /> {t('sidebar.performance')}
+                                    </ContextMenuItem>
+                                    <ContextMenuSeparator />
+                                    <ContextMenuItem className="gap-2 py-2" onClick={() => setBackupTarget({ connectionId: conn.id, database: db })}>
+                                      <Download className="h-4 w-4" /> {t('backup.title')}
+                                    </ContextMenuItem>
+                                    <ContextMenuItem className="gap-2 py-2" onClick={() => setRestoreTarget({ connectionId: conn.id, database: db })}>
+                                      <Upload className="h-4 w-4" /> {t('backup.restore')}
+                                    </ContextMenuItem>
+                                    {clipboardStore.copiedTable && clipboardStore.copiedTable.dbType === conn.db_type && (
+                                      <>
+                                        <ContextMenuSeparator />
+                                        <ContextMenuItem className="gap-2 py-2" onClick={() => {
+                                          setCopySource(clipboardStore.copiedTable!);
+                                          setCopyTarget({ connectionId: conn.id, database: db });
+                                          setCopyDialogOpen(true);
+                                        }}>
+                                          <ClipboardPaste className="h-4 w-4" /> {t('tableCopy.pasteTable')}
+                                        </ContextMenuItem>
+                                      </>
+                                    )}
                                     <ContextMenuSeparator />
                                     <ContextMenuItem className="gap-2 py-2" onClick={() => {
-                                      setCopySource(clipboardStore.copiedTable!);
-                                      setCopyTarget({ connectionId: conn.id, database: db });
-                                      setCopyDialogOpen(true);
+                                      if (isPG) loadSchemas(conn.id, db);
+                                      else loadTables(conn.id, db);
                                     }}>
-                                      <ClipboardPaste className="h-4 w-4" /> {t('tableCopy.pasteTable')}
+                                      <RefreshCw className="h-4 w-4" /> {t('sidebar.refresh')}
+                                    </ContextMenuItem>
+                                    <ContextMenuSeparator />
+                                    <ContextMenuItem
+                                      className="gap-2 py-2 text-destructive focus:text-destructive"
+                                      onClick={async () => {
+                                        const ok = await confirm('删除数据库', `确认删除数据库 "${db}" 吗？此操作不可恢复。`);
+                                        if (!ok) return;
+                                        try {
+                                          if (conn.db_type === 'postgresql') {
+                                            // PG: must disconnect all sessions from target DB first, then DROP from a different DB
+                                            const adminDb = conn.database || 'postgres';
+                                            const safeDb = adminDb === db ? 'postgres' : adminDb;
+                                            // Terminate all connections to the target database
+                                            await invoke('execute_query', {
+                                              connectionId: conn.id,
+                                              database: safeDb,
+                                              sql: `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${db}' AND pid <> pg_backend_pid()`,
+                                            });
+                                            // Now drop
+                                            await invoke('execute_query', {
+                                              connectionId: conn.id,
+                                              database: safeDb,
+                                              sql: `DROP DATABASE "${db}"`,
+                                            });
+                                          } else {
+                                            const sql = conn.db_type === 'mysql'
+                                              ? `DROP DATABASE \`${db}\``
+                                              : conn.db_type === 'sqlserver'
+                                                ? `DROP DATABASE [${db}]`
+                                                : `DROP DATABASE "${db}"`;
+                                            await invoke('execute_query', { connectionId: conn.id, database: db, sql });
+                                          }
+                                          notify.success('数据库已删除', db);
+                                          loadDatabases(conn.id);
+                                        } catch (e: any) {
+                                          notify.error('删除数据库失败', String(e));
+                                        }
+                                      }}
+                                    >
+                                      <Trash2 className="h-4 w-4" /> 删除数据库
                                     </ContextMenuItem>
                                   </>
                                 )}
-                                <ContextMenuSeparator />
-                                <ContextMenuItem className="gap-2 py-2" onClick={() => loadTables(conn.id, db)}>
-                                  <RefreshCw className="h-4 w-4" /> {t('sidebar.refresh')}
-                                </ContextMenuItem>
                               </ContextMenuContent>
                             </ContextMenu>
 
-                            {dbExpanded && (
-                              <>
-                                {/* Tables Category */}
-                                <button
-                                  className="flex w-full items-center gap-2 rounded-md py-1 pl-14 pr-2.5 text-left text-xs font-medium text-muted-foreground transition-colors hover:bg-sidebar-accent"
-                                  onClick={() => {
-                                    toggleExpand(tablesKey);
-                                    if (!tablesExpanded) loadTables(conn.id, db);
-                                  }}
-                                >
-                                  {tablesExpanded
-                                    ? <ChevronDown className="h-2.5 w-2.5 shrink-0" />
-                                    : <ChevronRight className="h-2.5 w-2.5 shrink-0" />
-                                  }
-                                  <Table2 className="h-3.5 w-3.5 shrink-0 text-emerald-500" />
-                                  <span>{tableLabel} ({tables.length})</span>
-                                </button>
-                                {tablesExpanded && tables.map((table) => (
-                                  <ContextMenu key={`${dbKey}::table::${table.name}`}>
-                                    <ContextMenuTrigger asChild>
-                                      <button
-                                        className="flex w-full items-center gap-2 rounded-md py-1.5 pl-20 pr-2.5 text-left text-sm transition-colors hover:bg-sidebar-accent"
-                                        onClick={() => handleViewData(conn.id, db, table.name)}
-                                        draggable
-                                        onDragStart={(e) => {
-                                          e.dataTransfer.setData('application/json', JSON.stringify({
-                                            connectionId: conn.id,
-                                            database: db,
-                                            tableName: table.name,
-                                            dbType: conn.db_type,
-                                          }));
-                                          e.dataTransfer.effectAllowed = 'copy';
-                                        }}
-                                      >
-                                        <Table2 className="h-3.5 w-3.5 shrink-0 text-emerald-500" />
-                                        <span className="truncate">{table.name}</span>
-                                      </button>
-                                    </ContextMenuTrigger>
-                                    <ContextMenuContent className="w-44">
-                                      <ContextMenuItem className="gap-2 py-2" onClick={() => handleViewData(conn.id, db, table.name)}>
-                                        <Eye className="h-4 w-4" /> {t('sidebar.viewData')}
-                                      </ContextMenuItem>
-                                      <ContextMenuItem className="gap-2 py-2" onClick={() => handleViewStructure(conn.id, db, table.name)}>
-                                        <Columns className="h-4 w-4" /> {t('sidebar.viewStructure')}
-                                      </ContextMenuItem>
-                                      <ContextMenuItem className="gap-2 py-2" onClick={() => handleViewChart(conn.id, db, table.name)}>
-                                        <BarChart3 className="h-4 w-4" /> {t('chart.title')}
-                                      </ContextMenuItem>
-                                      <ContextMenuSeparator />
-                                      <ContextMenuItem className="gap-2 py-2" onClick={() => handleOpenQuery(conn.id, db)}>
-                                        <Code className="h-4 w-4" /> {t('sidebar.openQuery')}
-                                      </ContextMenuItem>
-                                      <ContextMenuSeparator />
-                                      <ContextMenuItem className="gap-2 py-2" onClick={() => {
-                                        clipboardStore.copyTable({ connectionId: conn.id, database: db, tableName: table.name, dbType: conn.db_type });
-                                      }}>
-                                        <Copy className="h-4 w-4" /> {t('tableCopy.copyTable')}
-                                      </ContextMenuItem>
-                                    </ContextMenuContent>
-                                  </ContextMenu>
-                                ))}
+                            {/* Database tree content */}
+                            {dbExpanded && isPG && (
+                              <PostgresTree
+                                conn={conn}
+                                node={node}
+                                db={db}
+                                dbKey={dbKey}
+                                expandedKeys={expandedKeys}
+                                toggleExpand={toggleExpand}
+                                handleViewData={handleViewData}
+                                handleViewStructure={handleViewStructure}
+                                handleViewChart={handleViewChart}
+                                handleOpenObjectDef={handleOpenObjectDef}
+                                handleOpenQuery={handleOpenQuery}
+                                loadTables={loadTables}
+                                loadViews={loadViews}
+                                loadFunctions={loadFunctions}
+                                loadProcedures={loadProcedures}
+                                loadTriggers={loadTriggers}
+                                loadSchemas={loadSchemas}
+                                handleOpenERDiagram={handleOpenERDiagram}
+                                clipboardStore={clipboardStore}
+                              />
+                            )}
 
-                                {/* Views/Functions/Procedures/Triggers — SQL databases only */}
-                                {isSQL && (
-                                  <>
-                                    {/* Views */}
-                                    <button
-                                      className="flex w-full items-center gap-2 rounded-md py-1 pl-14 pr-2.5 text-left text-xs font-medium text-muted-foreground transition-colors hover:bg-sidebar-accent"
-                                      onClick={() => { toggleExpand(viewsKey); if (!viewsExpanded) loadViews(conn.id, db); }}
-                                    >
-                                      {viewsExpanded ? <ChevronDown className="h-2.5 w-2.5 shrink-0" /> : <ChevronRight className="h-2.5 w-2.5 shrink-0" />}
-                                      <Eye className="h-3.5 w-3.5 shrink-0 text-blue-500" />
-                                      <span>{t('sidebar.views')} ({views.length})</span>
-                                    </button>
-                                    {viewsExpanded && views.map((view) => (
-                                      <button key={`${dbKey}::view::${view.name}`} className="flex w-full items-center gap-2 rounded-md py-1.5 pl-20 pr-2.5 text-left text-sm transition-colors hover:bg-sidebar-accent" onClick={() => handleOpenObjectDef(conn.id, db, view.name, 'view')}>
-                                        <Eye className="h-3.5 w-3.5 shrink-0 text-blue-500" /><span className="truncate">{view.name}</span>
-                                      </button>
-                                    ))}
+                            {dbExpanded && isRedis && (
+                              <RedisTree
+                                conn={conn}
+                                node={node}
+                                db={db}
+                                dbKey={dbKey}
+                                expandedKeys={expandedKeys}
+                                toggleExpand={toggleExpand}
+                                handleViewRedisKey={handleViewRedisKey}
+                                handleRedisDeleteKey={handleRedisDeleteKey}
+                                redisKeyFilter={redisKeyFilter}
+                                setRedisKeyFilter={setRedisKeyFilter}
+                                setRedisAddKeyDialog={setRedisAddKeyDialog}
+                                loadTables={loadTables}
+                              />
+                            )}
 
-                                    {/* Functions */}
-                                    <button
-                                      className="flex w-full items-center gap-2 rounded-md py-1 pl-14 pr-2.5 text-left text-xs font-medium text-muted-foreground transition-colors hover:bg-sidebar-accent"
-                                      onClick={() => { toggleExpand(functionsKey); if (!functionsExpanded) loadFunctions(conn.id, db); }}
-                                    >
-                                      {functionsExpanded ? <ChevronDown className="h-2.5 w-2.5 shrink-0" /> : <ChevronRight className="h-2.5 w-2.5 shrink-0" />}
-                                      <FunctionSquare className="h-3.5 w-3.5 shrink-0 text-purple-500" />
-                                      <span>{t('sidebar.functions')} ({functions.length})</span>
-                                    </button>
-                                    {functionsExpanded && functions.map((func) => (
-                                      <button key={`${dbKey}::func::${func.name}`} className="flex w-full items-center gap-2 rounded-md py-1.5 pl-20 pr-2.5 text-left text-sm transition-colors hover:bg-sidebar-accent" onClick={() => handleOpenObjectDef(conn.id, db, func.name, 'function')}>
-                                        <FunctionSquare className="h-3.5 w-3.5 shrink-0 text-purple-500" /><span className="truncate">{func.name}</span>
-                                      </button>
-                                    ))}
+                            {dbExpanded && isMongo && (
+                              <MongoTree
+                                conn={conn}
+                                node={node}
+                                db={db}
+                                dbKey={dbKey}
+                                expandedKeys={expandedKeys}
+                                toggleExpand={toggleExpand}
+                                addTab={addTab}
+                                loadTables={loadTables}
+                              />
+                            )}
 
-                                    {/* Procedures */}
-                                    <button
-                                      className="flex w-full items-center gap-2 rounded-md py-1 pl-14 pr-2.5 text-left text-xs font-medium text-muted-foreground transition-colors hover:bg-sidebar-accent"
-                                      onClick={() => { toggleExpand(proceduresKey); if (!proceduresExpanded) loadProcedures(conn.id, db); }}
-                                    >
-                                      {proceduresExpanded ? <ChevronDown className="h-2.5 w-2.5 shrink-0" /> : <ChevronRight className="h-2.5 w-2.5 shrink-0" />}
-                                      <Workflow className="h-3.5 w-3.5 shrink-0 text-orange-500" />
-                                      <span>{t('sidebar.procedures')} ({procedures.length})</span>
-                                    </button>
-                                    {proceduresExpanded && procedures.map((proc) => (
-                                      <button key={`${dbKey}::proc::${proc.name}`} className="flex w-full items-center gap-2 rounded-md py-1.5 pl-20 pr-2.5 text-left text-sm transition-colors hover:bg-sidebar-accent" onClick={() => handleOpenObjectDef(conn.id, db, proc.name, 'procedure')}>
-                                        <Workflow className="h-3.5 w-3.5 shrink-0 text-orange-500" /><span className="truncate">{proc.name}</span>
-                                      </button>
-                                    ))}
-
-                                    {/* Triggers */}
-                                    <button
-                                      className="flex w-full items-center gap-2 rounded-md py-1 pl-14 pr-2.5 text-left text-xs font-medium text-muted-foreground transition-colors hover:bg-sidebar-accent"
-                                      onClick={() => { toggleExpand(triggersKey); if (!triggersExpanded) loadTriggers(conn.id, db); }}
-                                    >
-                                      {triggersExpanded ? <ChevronDown className="h-2.5 w-2.5 shrink-0" /> : <ChevronRight className="h-2.5 w-2.5 shrink-0" />}
-                                      <Zap className="h-3.5 w-3.5 shrink-0 text-yellow-500" />
-                                      <span>{t('sidebar.triggers')} ({triggers.length})</span>
-                                    </button>
-                                    {triggersExpanded && triggers.map((trigger) => (
-                                      <Tooltip key={`${dbKey}::trigger::${trigger.name}`}>
-                                        <TooltipTrigger asChild>
-                                          <button className="flex w-full items-center gap-2 rounded-md py-1.5 pl-20 pr-2.5 text-left text-sm transition-colors hover:bg-sidebar-accent">
-                                            <Zap className="h-3.5 w-3.5 shrink-0 text-yellow-500" /><span className="truncate">{trigger.name}</span>
-                                          </button>
-                                        </TooltipTrigger>
-                                        <TooltipContent side="right">{trigger.timing} {trigger.event} ON {trigger.table}</TooltipContent>
-                                      </Tooltip>
-                                    ))}
-                                  </>
-                                )}
-                              </>
+                            {dbExpanded && isSQL && !isPG && (
+                              <SqlDatabaseTree
+                                conn={conn}
+                                node={node}
+                                db={db}
+                                dbKey={dbKey}
+                                expandedKeys={expandedKeys}
+                                toggleExpand={toggleExpand}
+                                handleViewData={handleViewData}
+                                handleViewStructure={handleViewStructure}
+                                handleViewChart={handleViewChart}
+                                handleOpenObjectDef={handleOpenObjectDef}
+                                handleOpenQuery={handleOpenQuery}
+                                loadTables={loadTables}
+                                loadViews={loadViews}
+                                loadFunctions={loadFunctions}
+                                loadProcedures={loadProcedures}
+                                loadTriggers={loadTriggers}
+                                clipboardStore={clipboardStore}
+                              />
                             )}
                           </div>
                         );
@@ -539,12 +572,14 @@ export default function Sidebar() {
                                     <Users className="h-3.5 w-3.5 shrink-0 text-gray-500" />
                                     <span className="truncate">{user.name}</span>
                                     {user.host && (
-                                      <span className="ml-auto text-[10px] text-muted-foreground">@{user.host}</span>
+                                      <Badge variant={user.host === 'user' ? 'info' : 'secondary'} className="ml-auto text-[9px] px-1 py-0">
+                                        {user.host === 'user' ? '用户' : '组'}
+                                      </Badge>
                                     )}
                                   </button>
                                 </TooltipTrigger>
                                 <TooltipContent side="right">
-                                  {user.name}{user.host ? `@${user.host}` : ''}
+                                  {user.name}{user.host ? ` (${user.host === 'user' ? '用户' : '组'})` : ''}
                                 </TooltipContent>
                               </Tooltip>
                             ))}
@@ -587,6 +622,51 @@ export default function Sidebar() {
             target={copyTarget}
           />
         )}
+
+        {/* Redis Add Key Dialog */}
+        <Dialog open={!!redisAddKeyDialog} onOpenChange={(open) => { if (!open) { setRedisAddKeyDialog(null); setRedisNewKey(''); setRedisNewValue(''); setRedisNewTTL(''); } }}>
+          <DialogContent className="sm:max-w-[400px]">
+            <DialogHeader>
+              <DialogTitle>{t('redis.addKey')}</DialogTitle>
+              <DialogDescription>{redisAddKeyDialog?.database}</DialogDescription>
+            </DialogHeader>
+            <div className="flex flex-col gap-3 py-2">
+              <div>
+                <Label className="mb-1 block text-sm">{t('redis.keyName')}</Label>
+                <Input
+                  value={redisNewKey}
+                  onChange={(e) => setRedisNewKey(e.target.value)}
+                  placeholder={t('redis.keyName')}
+                />
+              </div>
+              <div>
+                <Label className="mb-1 block text-sm">{t('redis.value')}</Label>
+                <Input
+                  value={redisNewValue}
+                  onChange={(e) => setRedisNewValue(e.target.value)}
+                  placeholder={t('redis.value')}
+                />
+              </div>
+              <div>
+                <Label className="mb-1 block text-sm">{t('redis.ttl')}</Label>
+                <Input
+                  type="number"
+                  value={redisNewTTL}
+                  onChange={(e) => setRedisNewTTL(e.target.value)}
+                  placeholder={t('redis.noTTL')}
+                />
+              </div>
+            </div>
+            <DialogFooter>
+              <Button variant="outline" onClick={() => { setRedisAddKeyDialog(null); setRedisNewKey(''); setRedisNewValue(''); setRedisNewTTL(''); }}>
+                {t('common.cancel')}
+              </Button>
+              <Button onClick={handleRedisAddKey} disabled={!redisNewKey.trim()}>
+                {t('common.confirm')}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       </div>
     </TooltipProvider>
   );

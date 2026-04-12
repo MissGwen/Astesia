@@ -1,12 +1,16 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { useTabStore } from '@/stores/tabStore';
 import { useConnectionStore } from '@/stores/connectionStore';
+import { confirm } from '@/stores/confirmStore';
 import QueryEditor from '../QueryEditor';
-import DataGrid from '../DataGrid';
+import DataGrid from '../DataViewers/DataGrid';
+import RedisViewer from '../DataViewers/RedisViewer';
+import MongoViewer from '../DataViewers/MongoViewer';
 import TableStructure from '../TableStructure';
 import ObjectDefinition from '../ObjectDefinition';
 import PerformanceDashboard from '../PerformanceDashboard';
 import DataChartView from '../DataChartView';
+import ERDiagram from '../ERDiagram';
 import Sidebar from '../Sidebar';
 import StatusBar from '../StatusBar';
 import { Database, X } from 'lucide-react';
@@ -72,44 +76,49 @@ export default function AppLayout() {
     return tab.type === 'query' && tab.sqlContent && tab.sqlContent.trim();
   }, []);
 
-  const handleCloseTab = useCallback((key: string) => {
+  const handleCloseTab = useCallback(async (key: string) => {
     const tab = tabs.find(t => t.key === key);
     if (tab && hasUnsavedContent(tab)) {
-      if (!window.confirm('当前查询内容未保存，是否继续关闭？')) return;
+      const ok = await confirm('关闭标签页', '当前查询内容未保存，是否继续关闭？', 'default');
+      if (!ok) return;
     }
     removeTab(key);
   }, [tabs, hasUnsavedContent, removeTab]);
 
-  const handleCloseAllTabs = useCallback(() => {
+  const handleCloseAllTabs = useCallback(async () => {
     const unsavedTabs = tabs.filter(t => hasUnsavedContent(t));
     if (unsavedTabs.length > 0) {
-      if (!window.confirm('存在未保存的查询内容，是否继续关闭所有标签页？')) return;
+      const ok = await confirm('关闭标签页', '存在未保存的查询内容，是否继续关闭所有标签页？', 'default');
+      if (!ok) return;
     }
     removeAllTabs();
   }, [tabs, hasUnsavedContent, removeAllTabs]);
 
-  const handleCloseOtherTabs = useCallback((key: string) => {
+  const handleCloseOtherTabs = useCallback(async (key: string) => {
     const otherUnsaved = tabs.filter(t => t.key !== key && hasUnsavedContent(t));
     if (otherUnsaved.length > 0) {
-      if (!window.confirm('存在未保存的查询内容，是否继续关闭其他标签页？')) return;
+      const ok = await confirm('关闭标签页', '存在未保存的查询内容，是否继续关闭其他标签页？', 'default');
+      if (!ok) return;
     }
     removeOtherTabs(key);
   }, [tabs, hasUnsavedContent, removeOtherTabs]);
 
-  const handleCloseLeftTabs = useCallback((key: string) => {
+  const handleCloseLeftTabs = useCallback(async (key: string) => {
     const idx = tabs.findIndex(t => t.key === key);
     const leftUnsaved = tabs.slice(0, idx).filter(t => hasUnsavedContent(t));
     if (leftUnsaved.length > 0) {
-      if (!window.confirm('存在未保存的查询内容，是否继续关闭左边的标签页？')) return;
+      const ok = await confirm('关闭标签页', '存在未保存的查询内容，是否继续关闭左边的标签页？', 'default');
+      if (!ok) return;
     }
     removeLeftTabs(key);
   }, [tabs, hasUnsavedContent, removeLeftTabs]);
 
-  const handleCloseRightTabs = useCallback((key: string) => {
+  const handleCloseRightTabs = useCallback(async (key: string) => {
     const idx = tabs.findIndex(t => t.key === key);
     const rightUnsaved = tabs.slice(idx + 1).filter(t => hasUnsavedContent(t));
     if (rightUnsaved.length > 0) {
-      if (!window.confirm('存在未保存的查询内容，是否继续关闭右边的标签页？')) return;
+      const ok = await confirm('关闭标签页', '存在未保存的查询内容，是否继续关闭右边的标签页？', 'default');
+      if (!ok) return;
     }
     removeRightTabs(key);
   }, [tabs, hasUnsavedContent, removeRightTabs]);
@@ -146,6 +155,12 @@ export default function AppLayout() {
         return <PerformanceDashboard connectionId={tab.connectionId} database={tab.database} />;
       case 'data-chart':
         return <DataChartView connectionId={tab.connectionId} database={tab.database} table={tab.table!} />;
+      case 'er-diagram':
+        return <ERDiagram connectionId={tab.connectionId} database={tab.database} schema={tab.table} />;
+      case 'redis-viewer':
+        return <RedisViewer connectionId={tab.connectionId} database={tab.database} keyName={tab.table!} />;
+      case 'mongo-viewer':
+        return <MongoViewer connectionId={tab.connectionId} database={tab.database} collection={tab.table!} />;
       default:
         return null;
     }
