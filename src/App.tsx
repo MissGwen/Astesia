@@ -6,6 +6,8 @@ import { useClipboardStore } from './stores/clipboardStore';
 import { ToastContainer } from './components/ui/toast';
 import CreateResourceDialog from './components/CreateResourceDialog';
 import ConfirmDialog from './components/ConfirmDialog';
+import UpdateDialog from './components/UpdateDialog';
+import { useUpdateStore } from './stores/updateStore';
 import i18n from './i18n';
 import '@/lib/plugins'; // Initialize plugin registry
 import './styles/global.css';
@@ -13,6 +15,7 @@ import './styles/global.css';
 function App() {
   const { setConnections } = useConnectionStore();
   const initTheme = useThemeStore((s) => s.initTheme);
+  const checkForUpdates = useUpdateStore((s) => s.checkForUpdates);
 
   useEffect(() => {
     const cleanupTheme = initTheme();
@@ -38,6 +41,14 @@ function App() {
       cleanupTheme();
     };
   }, [setConnections, initTheme]);
+
+  // Check for updates after startup
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      checkForUpdates(true);
+    }, 3000);
+    return () => clearTimeout(timer);
+  }, [checkForUpdates]);
 
   // Disable Tauri default context menu globally
   // Radix ContextMenu intercepts right-click at higher priority, so custom
@@ -80,6 +91,7 @@ function App() {
       <ToastContainer />
       <CreateResourceDialog />
       <ConfirmDialog />
+      <UpdateDialog />
     </>
   );
 }
